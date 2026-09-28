@@ -2,6 +2,17 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer.
 
+## [0.2.0] — 2026-09-28
+
+### Added
+- `/strata-hq:garden` — the nightly upkeep: the sync, then the checks, one commit in HQ.
+- `template/scripts/hq_garden.py` — stale Strata wikis (≥5 commits the wiki missed, the oldest
+  >14 days old), docs whose `raw/` mirror is missing or stale, projects with no commit for 90
+  days; the report `wiki/garden.md` carries no timestamp, so a quiet night rewrites nothing.
+
+### Fixed
+- A new HQ ignores `scripts/__pycache__/`, so running the scripts leaves the tree clean.
+
 ## [0.1.0] — 2026-09-28
 
 First release — HQ moved out of Strata into its own plugin, so Strata stays small and HQ is

@@ -38,7 +38,7 @@ for f in template/scripts/*.py; do
 done
 
 echo "== 4. behaviour tests =="
-for t in scripts/test_hq_registry.sh scripts/test_hq_sync.sh; do
+for t in scripts/test_hq_registry.sh scripts/test_hq_sync.sh scripts/test_hq_garden.sh; do
   if out="$(bash "$t" 2>&1)"; then ok "$(printf '%s' "$out" | tail -n 1)"; else printf '%s\n' "$out" | grep '✗' >&2; err "$t failed"; fi
 done
 

@@ -26,6 +26,8 @@ Then say *"set up HQ"* / «создай HQ» — or run `/strata-hq:init`.
 | `scripts/hq_registry.py` | Builds `registry.yaml` from that source. A project leaves only when a successful read no longer lists it; a source that cannot be read changes nothing. |
 | `scripts/hq_sync.py` | Refreshes `projects/<slug>.md`, `groups/<group>.md` and `wiki/index.md` from git (HEAD, branch, remote without credentials, manifests, recent commits). It owns only the marked parts; your text and your own frontmatter keys stay. An unchanged project is not written — a second run rewrites nothing. |
 | `/strata-hq:sync` | Runs both scripts, then writes the prose (summary, relations) only for pages the script flags as new or stale. |
+| `scripts/hq_garden.py` | Checks every project for rot: a Strata wiki the code left behind (≥5 commits, the oldest >14 days old), `docs/` whose `raw/` mirror is missing or stale, no commits for 90 days. Writes `wiki/garden.md` only when a finding changed. |
+| `/strata-hq:garden` | The nightly job: the sync, then the checks, one commit in HQ, a short report. Schedule it with any scheduler (cron, an Orca automation). |
 | `/strata-hq:init` | Scaffolds HQ from `template/`, asks for the source, runs the first sync. |
 
 Nothing in HQ ever writes into a member project. Decisions: [`docs/decisions/`](docs/decisions/).
@@ -33,7 +35,7 @@ Nothing in HQ ever writes into a member project. Decisions: [`docs/decisions/`](
 ## Develop
 
 ```
-bash scripts/validate.sh        # manifests, skills, templates, both behaviour suites, nothing private
+bash scripts/validate.sh        # manifests, skills, templates, the behaviour suites, nothing private
 claude --plugin-dir .           # try the skills against a throwaway HQ
 ```
 

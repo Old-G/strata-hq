@@ -2,6 +2,17 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer.
 
+## [0.3.0] — 2026-09-28
+
+### Added
+- `template/scripts/hq_group_chat.py` — the chat folder of one group, `chats/<group>/`: a symlink
+  per local project, a CLAUDE.md pointing at the group page, its hub and each project page, and
+  `.claude/settings.local.json` letting Claude Code read HQ and every project
+  (`permissions.additionalDirectories`, the only key it owns there). Found by group id first, so a
+  renamed group keeps its chat; rebuilt on each run, a second run rewrites nothing; projects on
+  another host are listed, not linked.
+- A new HQ ignores `chats/`.
+
 ## [0.2.1] — 2026-09-28
 
 ### Fixed

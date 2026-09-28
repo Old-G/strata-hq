@@ -28,6 +28,7 @@ Then say *"set up HQ"* / «создай HQ» — or run `/strata-hq:init`.
 | `/strata-hq:sync` | Runs both scripts, then writes the prose (summary, relations) only for pages the script flags as new or stale. |
 | `scripts/hq_garden.py` | Checks every project for rot: a Strata wiki the code left behind (≥5 commits, the oldest >14 days old), `docs/` whose `raw/` mirror is missing or stale, no commits for 90 days. Writes `wiki/garden.md` only when a finding changed. |
 | `/strata-hq:garden` | The nightly job: the sync, then the checks, one commit in HQ, a short report. Schedule it with any scheduler (cron, an Orca automation). |
+| `scripts/hq_group_chat.py` | Builds `chats/<group>/`: a symlink per project of the group, a CLAUDE.md pointing at the group page, its hub and each project page, and a Claude Code setting that lets an agent there read every project. Open an agent in that folder to talk about the whole group at once. Rebuilt on each run; your own files there stay; not in git. |
 | `/strata-hq:init` | Scaffolds HQ from `template/`, asks for the source, runs the first sync. |
 
 Nothing in HQ ever writes into a member project. Decisions: [`docs/decisions/`](docs/decisions/).

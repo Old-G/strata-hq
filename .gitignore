@@ -1,0 +1,5 @@
+.DS_Store
+__pycache__/
+*.pyc
+# Words that must never be published, one ERE per line — read by scripts/validate.sh, never committed.
+.private-markers

@@ -1,0 +1,12 @@
+# Where HQ's registry comes from (ADR-1). Edit this file; never registry.yaml.
+#   paths — the list below (default; needs no other tool)
+#   orca  — the projects added to Orca, with their groups (set orca_cli to your Orca CLI)
+source: paths
+orca_cli: "orca"
+paths:
+# Optional:
+# short:            # slugs whose pages use page-templates/project-short.md
+#   - "some-project"
+# hubs:             # a group's hub when it is not the Strata project above its folders
+#   - group: "Group name"
+#     path: "~/path/to/hub"

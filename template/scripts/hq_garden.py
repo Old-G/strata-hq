@@ -94,7 +94,8 @@ def render(report):
     out += [f"- {page(s)} — raw/ mirror missing or stale for " + ", ".join(f"`{d}`" for d in docs)
             for s, docs in sorted(report["drift"].items())] or ["None."]
     out += ["", f"## Quiet projects ({len(report['quiet'])}) — no commit for {QUIET_DAYS} days", ""]
-    out += [f"- {page(s)} — last commit {report['quiet_since'][s]}" for s in report["quiet"]] or ["None."]
+    out += [f"- {page(s)} — " + (f"last commit {report['quiet_since'][s]}" if report["quiet_since"][s]
+                                 else "no commits yet") for s in report["quiet"]] or ["None."]
     if report["not_checked"]:
         out += ["", f"## Not checked ({len(report['not_checked'])})", ""]
         out += [f"- {page(s)} — {why}" for s, why in sorted(report["not_checked"].items())]

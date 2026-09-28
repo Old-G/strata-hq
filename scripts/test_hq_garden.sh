@@ -44,12 +44,13 @@ git init -q -b main "$WORK/nomirror"; G "$WORK/nomirror" add -A; commit_at "$WOR
 # quiet: last commit four months ago
 mkdir -p "$WORK/old"; printf 'o\n' > "$WORK/old/o.txt"
 git init -q -b main "$WORK/old"; G "$WORK/old" add -A; commit_at "$WORK/old" 120 "init"
+mkdir -p "$WORK/empty"; git init -q -b main "$WORK/empty"      # git, but no commit yet
 mkdir -p "$WORK/notes"; printf '# notes\n' > "$WORK/notes/todo.md"   # folder, not git
 
 HQ="$WORK/HQ"; cp -R "$ROOT/template" "$HQ"
 entry() { printf '  - id: "%s"\n    slug: "%s"\n    name: "%s"\n    path: "%s"\n    kind: "%s"\n    host: "%s"\n' "$@"; }
 { printf 'source: "paths"\nprojects:\n'
-  for p in stale fresh few synced nomirror old; do entry "r-$p" "$p" "$p" "$WORK/$p" git local; done
+  for p in stale fresh few synced nomirror old empty; do entry "r-$p" "$p" "$p" "$WORK/$p" git local; done
   entry r-notes notes notes "$WORK/notes" folder local
   entry r-gone gone gone "$WORK/gone" git local
   entry r-far far far "/srv/far" git "ssh:made-up-host"; } > "$HQ/registry.yaml"
@@ -65,12 +66,13 @@ check "stale wiki: ≥5 code commits the wiki never caught up with, the oldest �
 check "stale entry counts the commits behind" "$(printf '%s' "$out" | jq_ stale stale behind)" 7
 check "doc drift: edited or never-mirrored docs" "$(printf '%s' "$out" | jq_ drift stale)" "['docs/b.md', 'docs/c.md']"
 check "no raw/ at all → not a drift" "$(printf '%s' "$out" | jq_ drift | grep -c nomirror)" 0
-check "quiet: no commit for 90 days" "$(printf '%s' "$out" | jq_ quiet)" "['old']"
+check "quiet: no commit for 90 days, or none at all" "$(printf '%s' "$out" | jq_ quiet)" "['empty', 'old']"
+check "a repo with no commit says so, not 'None'" "$(grep -c 'empty.md) — no commits yet' "$HQ/wiki/garden.md") $(grep -c 'None' "$HQ/wiki/garden.md")" "1 0"
 check "missing and remote projects are not guessed" "$(printf '%s' "$out" | jq_ not_checked)" "{'far': 'unverifiable', 'gone': 'missing'}"
 check "report written" "$(printf '%s' "$out" | jq_ changed)" True
 check "report links the page of each finding" "$(grep -c '](../projects/stale.md)' "$HQ/wiki/garden.md")" 2
 check "report names the drifted doc" "$(grep -c 'docs/c.md' "$HQ/wiki/garden.md")" 1
-check "a log line for the change" "$(grep -c 'garden → stale 1, drift 1, quiet 1' "$HQ/wiki/log.md")" 1
+check "a log line for the change" "$(grep -c 'garden → stale 1, drift 1, quiet 2' "$HQ/wiki/log.md")" 1
 check "member projects untouched" "$(members)" "$members_before"
 
 echo "== hq garden: nothing changed =="

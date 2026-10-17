@@ -1,6 +1,6 @@
 ---
 name: garden
-description: Use for the scheduled upkeep of an EXISTING HQ — a nightly job, or when asked 'tend HQ', 'run the gardener', 'which wikis are stale', 'where do docs drift', 'which projects went quiet', «садовник», «прогони садовника», «ночной обход HQ», «какие вики устарели», «где дрейф документации», «какие проекты заброшены». Runs the sync, then checks every project for a wiki the code left behind, docs whose raw/ mirror is stale, and no commits for 90 days, and writes the findings to wiki/garden.md. Pure read of member projects; fixes nothing in them and sends nothing.
+description: Use for the scheduled upkeep of an EXISTING HQ — a nightly job, or when asked 'tend HQ', 'run the gardener', 'which wikis are stale', 'where do docs drift', 'which projects went quiet', «садовник», «прогони садовника», «ночной обход HQ», «какие вики устарели», «где дрейф документации», «какие проекты заброшены». Runs the sync, then checks every project for a wiki the code left behind, ingests the wiki still owes, docs whose raw/ mirror is stale, active projects with no wiki, and no commits for 90 days, and writes the findings to wiki/garden.md. Pure read of member projects; fixes nothing in them and sends nothing.
 ---
 
 # garden — nightly upkeep of HQ
@@ -15,11 +15,14 @@ project (`/strata:wiki-ingest`, `/strata:audit`).
 2. **Sync.** Run steps 2–5 of `/strata-hq:sync` (registry, pages, prose for `needs_summary`,
    index). A source that cannot be read is reported and the run goes on with the last registry.
 3. **Check.** `python3 scripts/hq_garden.py` → JSON with `stale` (slug → commits behind, the
-   last wiki commit, the oldest commit it missed), `drift` (slug → docs without an up-to-date
-   `raw/` mirror), `quiet`, `not_checked`, `changed`. It owns `wiki/garden.md` whole and appends
+   last wiki commit, the oldest commit it missed; Strata's own plumbing commits do not count),
+   `owed` (slug → docs whose `pending_ingest` marker no ingest retired; a project's own rule only for paths under `trust_ingest_rule:` in `hq.yaml`), `drift` (slug → docs
+   without an up-to-date `raw/` mirror), `nowiki` (slug → commits in the last 30 days in a
+   project with no Strata wiki), `quiet`, `not_checked`, `changed`. Every check reads the
+   default branch, not whatever branch the checkout is parked on. It owns `wiki/garden.md` whole and appends
    to `wiki/log.md` only when the report changed.
 4. **Commit** in HQ, by its own rules, only if the sync or the gardener changed something — one
-   commit, e.g. `chore(garden): stale 2, drift 1, quiet 5`. Push only if the owner asked.
+   commit, e.g. `chore(garden): stale 2, owed 1, drift 1, no wiki 3, quiet 5`. Push only if the owner asked.
 5. **Report** in a few lines: what the sync changed, then the findings that are new since the last
    report (from the commit's diff of `wiki/garden.md`), each with its project. Nothing new → say
    so in one line.

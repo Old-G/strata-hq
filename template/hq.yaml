@@ -10,3 +10,5 @@ paths:
 # hubs:             # a group's hub when it is not the Strata project above its folders
 #   - group: "Group name"
 #     path: "~/path/to/hub"
+# trust_ingest_rule: # project PATHS whose own scripts/lib/pending_ingest.sh the gardener may run to
+#   - "~/path/to/project" # count owed ingests (a project may narrow Strata's rule); nobody by default

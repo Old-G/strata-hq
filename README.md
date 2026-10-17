@@ -22,11 +22,11 @@ Then say *"set up HQ"* / «создай HQ» — or run `/strata-hq:init`.
 
 | Piece | What it does |
 |---|---|
-| `hq.yaml` | Where the list of projects comes from: `paths` (a list you edit; default) or `orca` (the projects added to [Orca](https://github.com/stablyai/orca), with their groups). Optional `short:` slugs get a short page; optional `hubs:` names a group's hub. |
+| `hq.yaml` | Where the list of projects comes from: `paths` (a list you edit; default) or `orca` (the projects added to [Orca](https://github.com/stablyai/orca), with their groups). Optional `short:` slugs get a short page; optional `hubs:` names a group's hub; optional `trust_ingest_rule:` project paths let the gardener run that project's own ingest rule. |
 | `scripts/hq_registry.py` | Builds `registry.yaml` from that source. A project leaves only when a successful read no longer lists it; a source that cannot be read changes nothing. |
 | `scripts/hq_sync.py` | Refreshes `projects/<slug>.md`, `groups/<group>.md` and `wiki/index.md` from git (HEAD, branch, remote without credentials, manifests, recent commits). It owns only the marked parts; your text and your own frontmatter keys stay. An unchanged project is not written — a second run rewrites nothing. |
 | `/strata-hq:sync` | Runs both scripts, then writes the prose (summary, relations) only for pages the script flags as new or stale. |
-| `scripts/hq_garden.py` | Checks every project for rot: a Strata wiki the code left behind (≥5 commits, the oldest >14 days old), `docs/` whose `raw/` mirror is missing or stale, no commits for 90 days. Writes `wiki/garden.md` only when a finding changed. |
+| `scripts/hq_garden.py` | Checks every project's default branch for rot: a Strata wiki the code left behind (≥5 commits beyond Strata's own plumbing, the oldest >14 days old), `pending_ingest` markers no ingest retired, `docs/` whose `raw/` mirror is missing or stale, projects with commits in the last 30 days and no wiki, no commits for 90 days. Writes `wiki/garden.md` only when a finding changed. |
 | `/strata-hq:garden` | The nightly job: the sync, then the checks, one commit in HQ, a short report. Schedule it with any scheduler (cron, an Orca automation). |
 | `scripts/hq_group_chat.py` | Builds `chats/<group>/`: a symlink per project of the group, a CLAUDE.md pointing at the group page, its hub and each project page, and a Claude Code setting that lets an agent there read every project. Open an agent in that folder to talk about the whole group at once. Rebuilt on each run; your own files there stay; not in git. |
 | `/strata-hq:init` | Scaffolds HQ from `template/`, asks for the source, runs the first sync. |

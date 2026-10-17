@@ -48,9 +48,17 @@ printf '%s\n' 'strata_pending_paths() { echo docs/b.md; }' > "$WORK/narrow/scrip
 # …and a project nobody trusted ships a rule too: registering a repo must not run its code
 mkdir -p "$WORK/stranger/scripts/lib"; cp -R "$WORK/owing/WIKI.md" "$WORK/owing/wiki" "$WORK/stranger/"
 printf '%s\n' "strata_pending_paths() { touch '$WORK/stranger-ran'; }" > "$WORK/stranger/scripts/lib/pending_ingest.sh"
-for p in owing narrow stranger; do mkdir -p "$WORK/$p/docs"; for d in a b c; do printf '%s\n' "$d" > "$WORK/$p/docs/$d.md"; done; done
+# a trusted rule still gets a bare environment and no stdin: it lists docs/a.md only if it sees the
+# gardener's secret, and echoes whatever it can read from stdin
+mkdir -p "$WORK/leaky/scripts/lib"; cp -R "$WORK/owing/WIKI.md" "$WORK/owing/wiki" "$WORK/leaky/"
+printf '%s\n' 'strata_pending_paths() { echo docs/b.md; [ -n "${HQ_FIXTURE_SECRET:-}" ] && echo docs/a.md; IFS= read -r l && echo "$l"; return 0; }' > "$WORK/leaky/scripts/lib/pending_ingest.sh"
+# a trusted path whose rule is a symlink out of the project: not run, Strata's default rule instead
+mkdir -p "$WORK/escape/scripts/lib" "$WORK/outside"; cp -R "$WORK/owing/WIKI.md" "$WORK/owing/wiki" "$WORK/escape/"
+printf '%s\n' "strata_pending_paths() { touch '$WORK/escape-ran'; echo docs/a.md; }" > "$WORK/outside/pending_ingest.sh"
+ln -s "$WORK/outside/pending_ingest.sh" "$WORK/escape/scripts/lib/pending_ingest.sh"
+for p in owing narrow stranger leaky escape; do mkdir -p "$WORK/$p/docs"; for d in a b c; do printf '%s\n' "$d" > "$WORK/$p/docs/$d.md"; done; done
 rm "$WORK/owing/docs/a.md"   # owing: a.md is gone — nothing left to ingest, not a debt
-for p in owing narrow stranger; do G "$WORK/$p" init -q -b main 2>/dev/null || git init -q -b main "$WORK/$p"; G "$WORK/$p" add -A; commit_at "$WORK/$p" 2 "init"; done
+for p in owing narrow stranger leaky escape; do G "$WORK/$p" init -q -b main 2>/dev/null || git init -q -b main "$WORK/$p"; G "$WORK/$p" add -A; commit_at "$WORK/$p" 2 "init"; done
 # docs→raw mirror: a.md mirrored, b.md edited without its mirror, c.md never mirrored
 mkdir -p "$WORK/stale/docs" "$WORK/stale/raw"
 printf 'a\n' > "$WORK/stale/docs/a.md"; cp "$WORK/stale/docs/a.md" "$WORK/stale/raw/a.md"
@@ -70,24 +78,26 @@ mkdir -p "$WORK/notes"; printf '# notes\n' > "$WORK/notes/todo.md"   # folder, n
 HQ="$WORK/HQ"; cp -R "$ROOT/template" "$HQ"
 entry() { printf '  - id: "%s"\n    slug: "%s"\n    name: "%s"\n    path: "%s"\n    kind: "%s"\n    host: "%s"\n' "$@"; }
 { printf 'source: "paths"\nprojects:\n'
-  for p in stale fresh few synced nomirror old empty upkeep parked owing narrow stranger; do entry "r-$p" "$p" "$p" "$WORK/$p" git local; done
+  for p in stale fresh few synced nomirror old empty upkeep parked owing narrow stranger leaky escape; do entry "r-$p" "$p" "$p" "$WORK/$p" git local; done
   entry r-notes notes notes "$WORK/notes" folder local
   entry r-gone gone gone "$WORK/gone" git local
   entry r-far far far "/srv/far" git "ssh:made-up-host"; } > "$HQ/registry.yaml"
-printf 'trust_ingest_rule:\n  - "%s"\n  - "stranger"\n' "$WORK/narrow" >> "$HQ/hq.yaml"   # a slug is not a trust
+printf 'trust_ingest_rule:\n  - "%s"\n  - "%s"\n  - "%s"\n  - "stranger"\n' "$WORK/narrow" "$WORK/leaky" "$WORK/escape" >> "$HQ/hq.yaml"   # a slug is not a trust
 garden() { python3 "$HQ/scripts/hq_garden.py" --hq "$HQ" "$@"; }
 jq_()  { python3 -c 'import json,sys;d=json.load(sys.stdin);v=d;[v:=v[k] for k in sys.argv[1:]];print(v)' "$@"; }
 snap() { (cd "$HQ" && find . -type f -not -path './.git/*' -exec cksum {} + | sort); }
-members() { for p in stale fresh few synced nomirror old upkeep parked owing narrow stranger; do G "$WORK/$p" status --porcelain; G "$WORK/$p" rev-parse HEAD; done; }
+members() { for p in stale fresh few synced nomirror old upkeep parked owing narrow stranger leaky escape; do G "$WORK/$p" status --porcelain; G "$WORK/$p" rev-parse HEAD; done; }
 
 echo "== hq garden: first run =="
 members_before="$(members)"
-out="$(garden)"; check "exit 0" "$?" 0
+out="$(printf 'docs/c.md\n' | HQ_FIXTURE_SECRET=made-up garden)"; check "exit 0" "$?" 0
 check "stale wiki: ≥5 code commits the wiki never caught up with, the oldest ≥14 days old; plumbing-only commits are not code; the default branch counts, not the parked checkout" "$(printf '%s' "$out" | jq_ stale | python3 -c 'import ast,sys;print(sorted(ast.literal_eval(sys.stdin.read())))')" "['parked', 'stale']"
-check "owed ingests: markers no later ingest retired, a re-edit reopens, prose is not a path, a deleted doc is no debt; a trusted project's own rule wins" "$(printf '%s' "$out" | jq_ owed)" "{'narrow': ['docs/b.md'], 'owing': ['docs/b.md', 'docs/c.md'], 'stranger': ['docs/b.md', 'docs/c.md']}"
+check "owed ingests: markers no later ingest retired, a re-edit reopens, prose is not a path, a deleted doc is no debt; a trusted project's own rule wins" "$(printf '%s' "$out" | jq_ owed)" "{'escape': ['docs/b.md', 'docs/c.md'], 'leaky': ['docs/b.md'], 'narrow': ['docs/b.md'], 'owing': ['docs/b.md', 'docs/c.md'], 'stranger': ['docs/b.md', 'docs/c.md']}"
 check "an untrusted project's rule never runs" "$([ -e "$WORK/stranger-ran" ] && echo ran || echo not-run)" not-run
+check "a trusted rule sees neither the gardener's secrets nor its stdin" "$(printf '%s' "$out" | jq_ owed leaky)" "['docs/b.md']"
+check "a trusted rule symlinked out of its project never runs; the default rule judges instead" "$([ -e "$WORK/escape-ran" ] && echo ran || echo not-run) $(printf '%s' "$out" | jq_ owed escape)" "not-run ['docs/b.md', 'docs/c.md']"
 check "no wiki: a non-Strata repo with recent commits; a quiet one is not listed" "$(printf '%s' "$out" | jq_ nowiki)" "{'nomirror': 1}"
-check "report has the new sections" "$(grep -c '^## Ingests owed (3)\|^## No wiki (1)' "$HQ/wiki/garden.md")" 2
+check "report has the new sections" "$(grep -c '^## Ingests owed (5)\|^## No wiki (1)' "$HQ/wiki/garden.md")" 2
 check "stale entry counts the commits behind" "$(printf '%s' "$out" | jq_ stale stale behind)" 7
 check "doc drift: edited or never-mirrored docs" "$(printf '%s' "$out" | jq_ drift stale)" "['docs/b.md', 'docs/c.md', 'docs/e\`x\`[y](z).md']"
 check "no raw/ at all → not a drift" "$(printf '%s' "$out" | jq_ drift | grep -c nomirror)" 0
@@ -98,7 +108,7 @@ check "report written" "$(printf '%s' "$out" | jq_ changed)" True
 check "report links the page of each finding" "$(grep -c '](../projects/stale.md)' "$HQ/wiki/garden.md")" 2
 check "a file name carries no markup into the report" "$(grep -c 'docs/e?x??y??z?.md' "$HQ/wiki/garden.md") $(grep -c '\[y\](z)' "$HQ/wiki/garden.md")" "1 0"
 check "report names the drifted doc" "$(grep -c 'stale.md) — raw/ mirror.*docs/c.md' "$HQ/wiki/garden.md")" 1
-check "a log line for the change" "$(grep -c 'garden → stale 2, drift 1, quiet 2, owed 3, no wiki 1' "$HQ/wiki/log.md")" 1
+check "a log line for the change" "$(grep -c 'garden → stale 2, drift 1, quiet 2, owed 5, no wiki 1' "$HQ/wiki/log.md")" 1
 check "member projects untouched" "$(members)" "$members_before"
 
 echo "== hq garden: nothing changed =="

@@ -2,6 +2,14 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer.
 
+## [0.4.1] — 2026-10-18
+
+### Security
+- A trusted project's `scripts/lib/pending_ingest.sh` now runs with a bare environment
+  (`PATH=/usr/bin:/bin`, `HOME`, locale, `STRATA_WIKI_LOG`) and no stdin, so none of the
+  gardener's tokens or keys reach it; a rule that is not a file inside its project (a symlink out
+  of it) is not run, and Strata's default rule judges that project instead.
+
 ## [0.4.0] — 2026-10-17
 
 ### Added

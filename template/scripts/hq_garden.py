@@ -13,7 +13,9 @@ a feature branch does not hide what landed:
     without running anything from the project. A project may narrow that rule in its own
     scripts/lib/pending_ingest.sh; its checkout's copy is run only for project PATHS the owner
     lists under `trust_ingest_rule:` in hq.yaml — a path, not a slug, so a registry rebuild that
-    moves a slug to another repo carries no trust along (registering a repo is not trusting it);
+    moves a slug to another repo carries no trust along (registering a repo is not trusting it) —
+    and only when it is a file inside the project, run with a bare environment (PATH=/usr/bin:/bin,
+    HOME, locale) and no stdin, so none of the gardener's tokens reach it;
   - doc drift: a docs/**/*.md whose raw/ mirror is missing or differs (Strata's docs→raw rule),
     checked only where the project keeps a raw/ at all;
   - no wiki: a git project without a Strata wiki that still had commits in the last ACTIVE_DAYS —
@@ -99,15 +101,21 @@ def owed_ingests(path, ref, trusted):
 
 
 def project_rule(path, log):
-    """The checkout's own rule (an owner-trusted project only) over the log at the default branch."""
-    lib = os.path.join(path, "scripts", "lib", "pending_ingest.sh")
+    """The checkout's own rule (owner-trusted, a file inside the project) over the log at the default
+    branch, run bare — no inherited environment, no stdin. None → Strata's default rule."""
+    root = os.path.realpath(path)
+    lib = os.path.realpath(os.path.join(root, "scripts", "lib", "pending_ingest.sh"))
+    if not lib.startswith(root + os.sep) or not os.path.isfile(lib):
+        return None
+    env = {k: os.environ[k] for k in ("HOME", "LANG", "LC_ALL") if k in os.environ}
     with tempfile.NamedTemporaryFile("w", suffix=".md", encoding="utf-8") as f:
         f.write(log + "\n")
         f.flush()
         try:
             out = subprocess.run(["bash", "-c", '. "$1" && strata_pending_paths', "_", lib],
-                                 cwd=path, capture_output=True, text=True, timeout=30,
-                                 env={**os.environ, "STRATA_WIKI_LOG": f.name})
+                                 cwd=root, stdin=subprocess.DEVNULL, capture_output=True,
+                                 text=True, timeout=30,
+                                 env={**env, "PATH": "/usr/bin:/bin", "STRATA_WIKI_LOG": f.name})
         except (OSError, subprocess.TimeoutExpired):
             return None
     return sorted({p for p in out.stdout.splitlines() if p.strip()}) if out.returncode == 0 else None

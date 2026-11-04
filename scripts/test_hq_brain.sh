@@ -267,6 +267,21 @@ check "a second run distills nothing new" "$(brain atoms --source claude | tail 
 check "stats count atoms by kind" "$(brain stats --json | field atoms decision)/$(brain stats --json | field atom_runs dropped)" "1/2"
 out="$(brain eval "$WORK/questions.yaml" --json)"
 check "eval runs with atoms on and can turn them off" "$(printf '%s' "$out" | field atoms) $(brain eval "$WORK/questions.yaml" --no-atoms --json | field atoms)" "True False"
+check "claims default to the chat's language" "$(grep -c "one self-contained sentence in the chat's language" "$PROMPT_LOG")" 1
+check "the prompt tells the owner's words from relayed ones and the agent's self-corrections" "$(grep -c 'an agent correcting itself is a fix or a fact, never a correction' "$PROMPT_LOG")" 1
+cid="$(brain atoms --source claude --redo --dry-run | head -n 1 | awk '{print $1}')"
+printf 'brain_language: "Russian"\n' >> "$HQ/hq.yaml"
+: > "$PROMPT_LOG"
+check "--doc re-distills exactly that chat" "$(brain atoms --source claude --doc "$cid" | tail -n 1 | grep -o '^atoms: 1 chats, 2 kept')" "atoms: 1 chats, 2 kept"
+check "brain_language sets the claims' language" "$(grep -c 'one self-contained sentence in Russian' "$PROMPT_LOG")" 1
+check "--doc with an unknown id distills nothing" "$(brain atoms --source claude --doc 999999999 | tail -n 1 | grep -o '^atoms: 0 chats')" "atoms: 0 chats"
+printf 'brain_owner: "Ann"\nbrain_relay_markers:\n  - "Continue from"\n' >> "$HQ/hq.yaml"
+: > "$PROMPT_LOG"
+brain atoms --source claude --doc "$cid" >/dev/null
+check "brain_owner names the owner in the prompt" "$(grep -c 'between the owner, Ann (user)' "$PROMPT_LOG")" 1
+check "without a matching marker no message is relayed" "$(grep -c '] relayed ' "$PROMPT_LOG")" 0
+check "parse_atoms takes the first JSON object when the model repeats it" "$(cd "$HQ" && python3 -c 'import sys; sys.path.insert(0, "scripts"); import hq_brain as b; print(len(b.parse_atoms("{\"atoms\":[{\"kind\":\"fact\"}]}{\"atoms\":[]}")))')" 1
+check "a user message starting with a relay marker is shown as relayed" "$(cd "$HQ" && python3 -c 'import sys; sys.path.insert(0, "scripts"); import hq_brain as b; print(b.render_chat([{"n": 1, "role": "user", "ts": 0, "text": "Continue from x", "shown": "Continue from x"}, {"n": 2, "role": "user", "ts": 0, "text": "ok", "shown": "ok"}], ["Continue from"]).count("relayed"))')" 1
 
 echo "== config errors =="
 printf 'brain:\n  - name: "nokind"\n' > "$WORK/bad.yaml"; mkdir -p "$WORK/bad"; cp "$WORK/bad.yaml" "$WORK/bad/hq.yaml"

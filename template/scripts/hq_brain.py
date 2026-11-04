@@ -44,6 +44,9 @@ counts for its source chat and points to the message it quotes. The model is a c
 `brain_model:` — the prompt goes to its stdin; it prints the answer as text, as JSONL events (the last
 `agent_message`, usage from `turn.completed`) or as one JSON object with `result` and `usage`.
 `brain_atoms_skip:` — title/first-prompt substrings of chats not worth distilling (automation runs).
+`brain_language:` — the language atoms' claims are written in (default: the chat's own language).
+`brain_owner:` — the owner's name, so claims say who decided. `brain_relay_markers:` — prefixes of user messages
+written by a script, another agent or another person (handoffs, relayed replies); the model sees them as relayed.
 
 Usage:
   python3 scripts/hq_brain.py index  [--hq DIR] [--full] [--source NAME]
@@ -1040,7 +1043,7 @@ MASKS = [
      "<token>"),
 ]
 
-PROMPT = """Extract knowledge atoms from this chat between the owner (user) and an AI agent (assistant).
+PROMPT = """Extract knowledge atoms from this chat between the owner, %(owner)s (user), and an AI agent (assistant).
 Return ONLY JSON: {"atoms":[{"kind":"...","claim":"...","quote":"...","msg":N,"entities":["..."],"confidence":0.0}]}
 kind — one of:
   decision: something decided, chosen or approved;
@@ -1049,12 +1052,21 @@ kind — one of:
   preference: how the owner wants things done;
   question: a question still open at the end of the chat;
   person: a fact about a named person (role, responsibility, what they asked for);
-  correction: the owner corrected the agent (what was wrong, what is right).
-Rules: 0-%(max)d atoms, only knowledge worth finding weeks later — skip greetings, progress reports, tool noise,
-anything still being guessed. claim: one self-contained sentence in the chat's language, with the names, ids and
-dates it needs to be understood without the chat. quote: 20-200 characters copied VERBATIM from message [msg]
-(same words, same order, no "..."), the part that proves the claim. entities: task ids, projects, people,
-systems, files named. confidence: 0-1, how sure the claim is right and final. No atoms → {"atoms":[]}.
+  correction: the owner corrected the agent in his own words (what was wrong, what is right).
+Who wrote it: a "user" message is the owner's own words only when he typed or dictated it. A "relayed" message,
+and a "user" message that reads like a brief ("Continue from …", "Do: 1) … 2) …", a quoted message with a sender),
+was written by another agent, a script or another person. Name the real author in the claim: the owner by name,
+the person by name, "the agent", "a task from another chat". preference and correction come only from the owner's
+own words; an agent correcting itself is a fix or a fact, never a correction.
+Keep: what the agent reports it did and checked (fixed, shipped, merged, measured — with ids, numbers and the
+reason) as fix or fact; who asked for what or owns what as person; decisions and open questions.
+Rules: 0-%(max)d atoms, only knowledge worth finding weeks later — skip greetings, "working on it" updates, tool
+noise, routine status moves (a task kept in a status, the next session started), anything still being guessed. claim: one self-contained sentence in %(lang)s, with the names, ids and dates it
+needs to be understood without the chat. It says only what message [msg] itself supports: do not join messages
+from different turns or days into one claim, and do not add details the message does not state. quote: 20-200
+characters copied VERBATIM from message [msg] (same words, same order, no "..."), the part that proves the claim.
+entities: task ids, projects, people, systems, files named. confidence: 0-1, how sure the claim is right and
+final. No atoms → {"atoms":[]}.
 
 CHAT (project: %(project)s):
 %(chat)s"""
@@ -1082,11 +1094,16 @@ def quote_in(quote, text):
     return all(p and p in hay for p in parts)
 
 
+def as_list(value):
+    return value if isinstance(value, list) else [value] if value else []
+
+
 def atoms_config(hq):
     cfg = read_yaml_subset(os.path.join(hq, "hq.yaml"))
     skip = cfg.get("brain_atoms_skip") or []
     return {"model": cfg.get("brain_model"), "skip": [str(x).lower() for x in (skip if isinstance(skip, list) else [skip])],
-            "budget": int(cfg.get("brain_atoms_budget") or ATOM_BUDGET)}
+            "budget": int(cfg.get("brain_atoms_budget") or ATOM_BUDGET), "lang": cfg.get("brain_language"),
+            "owner": cfg.get("brain_owner"), "relay": [str(x) for x in as_list(cfg.get("brain_relay_markers"))]}
 
 
 def chat_candidates(db, sources, skip, redo=False, min_turns=2):
@@ -1150,11 +1167,13 @@ def chat_dialogue(db, cid, budget=ATOM_BUDGET):
     return picked
 
 
-def render_chat(msgs):
+def render_chat(msgs, relay=()):
+    """Numbered dialogue; a user message that starts with a relay marker is labelled relayed (not the owner's words)."""
     lines = []
     for m in msgs:
         day = dt.datetime.fromtimestamp(m["ts"]).strftime("%Y-%m-%d")
-        lines.append(f"[{m['n']}] {m['role']} {day}: {m['shown']}")
+        role = "relayed" if m["role"] == "user" and m["text"].lstrip().startswith(tuple(relay)) else m["role"]
+        lines.append(f"[{m['n']}] {role} {day}: {m['shown']}")
     return "\n\n".join(lines)
 
 
@@ -1195,10 +1214,10 @@ def run_model(cmd, prompt, timeout=600):
 def parse_atoms(answer):
     s = answer.strip()
     s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s)
-    a, b = s.find("{"), s.rfind("}")
-    if a < 0 or b < a:
+    a = s.find("{")
+    if a < 0:
         raise ValueError("no JSON object in the answer")
-    data = json.loads(s[a:b + 1])
+    data, _ = json.JSONDecoder().raw_decode(s[a:])        # the first object; models sometimes repeat it
     items = data.get("atoms") if isinstance(data, dict) else data
     if not isinstance(items, list):
         raise ValueError("`atoms` is not a list")
@@ -1256,9 +1275,11 @@ def store_atoms(db, cid, atoms, model):
                    (aid, stem_text(body), " ".join(extract_ids(body))))
 
 
-def distill(cmd, msgs, project=None):
+def distill(cmd, msgs, project=None, conf=None):
     """One model call over one chat → (kept atoms, dropped, run record)."""
-    prompt = PROMPT % {"max": ATOM_MAX, "chat": render_chat(msgs), "project": project or "-"}
+    conf = conf or {}
+    prompt = PROMPT % {"max": ATOM_MAX, "chat": render_chat(msgs, conf.get("relay") or ()), "project": project or "-",
+                       "lang": conf.get("lang") or "the chat's language", "owner": conf.get("owner") or "the owner"}
     answer, usage, secs, err = run_model(cmd, prompt)
     rec = {"calls": 1, "chars": len(prompt), "secs": secs, "in": usage.get("input_tokens"),
            "cached": usage.get("cached_input_tokens") or usage.get("cache_read_input_tokens"),
@@ -1285,7 +1306,12 @@ def cmd_atoms(args):
         print(f"no index at {path} — run `hq_brain.py index` first", file=sys.stderr)
         return 3
     db = connect(path, write=True)
-    todo = chat_candidates(db, chat_sources, conf["skip"], redo=args.redo)[:args.limit]
+    if args.doc:
+        # Why: re-distilling a fixed sample (after a prompt change) must hit the same chats, skip list or not.
+        wanted = set(args.doc)
+        todo = [c for c in chat_candidates(db, chat_sources, [], redo=True, min_turns=0) if c[0] in wanted]
+    else:
+        todo = chat_candidates(db, chat_sources, conf["skip"], redo=args.redo)[:args.limit]
     jobs = []
     for cid, title, project in todo:
         msgs = chat_dialogue(db, cid, conf["budget"])
@@ -1293,13 +1319,13 @@ def cmd_atoms(args):
             jobs.append((cid, title, msgs, project))
     if args.dry_run:
         for cid, title, msgs, _ in jobs:
-            print(f"  {cid} · {len(msgs)} msgs · {len(render_chat(msgs))} chars · {(title or '')[:70]}")
+            print(f"  {cid} · {len(msgs)} msgs · {len(render_chat(msgs, conf['relay']))} chars · {(title or '')[:70]}")
         print(f"{len(jobs)} chats would be distilled")
         return 0
     model = conf["model"]
     t0, totals = time.time(), {"kept": 0, "dropped": 0, "calls": 0, "errors": 0, "in": 0, "cached": 0, "out": 0}
     with ThreadPoolExecutor(max_workers=max(1, min(args.jobs, 3))) as pool:
-        futs = {pool.submit(distill, model, msgs, project): (cid, title) for cid, title, msgs, project in jobs}
+        futs = {pool.submit(distill, model, msgs, project, conf): (cid, title) for cid, title, msgs, project in jobs}
         for n, fut in enumerate(as_completed(futs), 1):
             cid, title = futs[fut]
             kept, dropped, rec = fut.result()
@@ -1479,6 +1505,7 @@ def main(argv=None):
     p.add_argument("--jobs", type=int, default=1, help="parallel model calls, at most 3")
     p.add_argument("--dry-run", action="store_true", help="list the chats and prompt sizes, call nothing")
     p.add_argument("--redo", action="store_true", help="also chats already distilled")
+    p.add_argument("--doc", type=int, action="append", help="only this chat id (repeat); implies --redo")
     p = sub.add_parser("eval")
     p.add_argument("questions")
     p.add_argument("--limit", type=int, default=8)

@@ -2,6 +2,25 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer.
 
+## [0.6.1] — 2026-11-04
+
+### Changed
+- Atoms name who said it: the prompt tells the owner's own words from relayed messages, handoffs and
+  task briefs written by another agent or a script; preference and correction come only from the
+  owner, and an agent correcting itself is a fix or a fact. A claim says only what its quoted message
+  supports. A 30-atom manual check had 5 misses: wrong author, an agent's self-correction typed as the
+  owner's, an English claim in a Russian chat, details joined from other messages.
+- Agent reports of what was done and checked (fixed, shipped, merged, measured) are kept as fix or fact.
+
+### Added
+- `brain_language:` (the claims' language), `brain_owner:` (the owner's name in claims) and
+  `brain_relay_markers:` (prefixes of user messages that are not the owner's words; shown as relayed).
+- `hq_brain.py atoms --doc ID` (repeatable) re-distills exactly those chats, e.g. a fixed sample
+  after a prompt change.
+
+### Fixed
+- A model answer that repeats its JSON object no longer fails the chat: the first object is used.
+
 ## [0.6.0] — 2026-11-04
 
 ### Added

@@ -229,7 +229,7 @@ cat > "$WORK/model.py" <<'PY'
 # A made-up model: Codex-style JSONL events. Keeps the prompt so the test can see what was sent.
 import json, os, sys
 prompt = sys.stdin.read()
-open(os.environ["PROMPT_LOG"], "a").write(prompt + "\n=====\n")
+open(os.environ["PROMPT_LOG"], "a").write(prompt + "\n=====\n" + ("checker-command\n" if "--checker" in sys.argv else ""))
 atoms = [
   {"kind": "decision", "claim": "Капибара-бэкап хранится четырнадцать дней.", "quote": "бэкап храним четырнадцать дней, не больше",
    "msg": 3, "entities": ["backup"], "confidence": 0.9},
@@ -237,10 +237,21 @@ atoms = [
    "quote": "Бэкап падал, потому что диск переполнен", "msg": 1, "entities": [], "confidence": 0.8},
   {"kind": "fact", "claim": "Придуманный факт.", "quote": "этой фразы в чате нет совсем", "msg": 2, "entities": [], "confidence": 0.9},
   {"kind": "bogus", "claim": "Неизвестный тип.", "quote": "Принято, срок хранения", "msg": 4},
+  {"kind": "fact", "claim": "Срок хранения записан в DEV-999.", "quote": "Принято, срок хранения четырнадцать дней", "msg": 4},
+  {"kind": "preference", "claim": "Агент любит короткие сроки.", "quote": "Принято, срок хранения четырнадцать дней", "msg": 4},
+  {"kind": "fact", "claim": "Срок хранения согласовали с Bob.", "quote": "Принято, срок хранения четырнадцать дней", "msg": 4},
 ]
+if prompt.startswith("You check knowledge atoms"):
+    # The checker: drops what Bob did not say, retypes nothing, keeps the rest.
+    n = len([l for l in prompt.splitlines() if l[:1] == "[" and "]" in l[:5]])
+    claims = [l.split(": ", 1)[1] for l in prompt.splitlines() if l[:1] == "[" and "]" in l[:5]]
+    answer = {"verdicts": [{"i": i, "keep": "Bob" not in c, "claim": None, "kind": None, "why": "-"}
+                           for i, c in enumerate(claims, 1)]}
+else:
+    answer = {"atoms": atoms}
 print(json.dumps({"type": "thread.started"}))
 print(json.dumps({"type": "item.completed", "item": {"type": "agent_message",
-                  "text": "```json\n" + json.dumps({"atoms": atoms}, ensure_ascii=False) + "\n```"}}))
+                  "text": "```json\n" + json.dumps(answer, ensure_ascii=False) + "\n```"}}))
 print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1000, "cached_input_tokens": 400, "output_tokens": 50}}))
 PY
 brain index >/dev/null 2>&1
@@ -253,9 +264,10 @@ EOF
 check "dry run lists the chat, skips the automation run by brain_atoms_skip" "$(brain atoms --source claude --dry-run | tail -n 1)" "1 chats would be distilled"
 export PROMPT_LOG="$WORK/prompt.log"
 out="$(brain atoms --source claude 2>&1)"; check "atoms exits 0" "$?" 0
-check "quote check: 2 kept, 2 dropped (quote not in the chat, unknown kind)" "$(printf '%s\n' "$out" | tail -n 1 | grep -o '1 chats, 2 kept, 2 dropped')" "1 chats, 2 kept, 2 dropped"
-check "tokens are counted" "$(printf '%s\n' "$out" | tail -n 1 | grep -o 'tokens in 1000 (cached 400) out 50')" "tokens in 1000 (cached 400) out 50"
-check "emails and keys are masked before the model sees them" "$(grep -c 'bob@acme.example\|sk-abcdefghij' "$PROMPT_LOG") $(grep -c '<email>' "$PROMPT_LOG")" "0 1"
+check "checks: 2 kept, 5 dropped (no quote, unknown kind, id not in its message, agent's «preference», checker said no)" "$(printf '%s\n' "$out" | tail -n 1 | grep -o '1 chats, 2 kept, 5 dropped')" "1 chats, 2 kept, 5 dropped"
+check "the checker is a second model call; tokens of both are counted" "$(printf '%s\n' "$out" | tail -n 1 | grep -o '2 model calls · tokens in 2000 (cached 800) out 100')" "2 model calls · tokens in 2000 (cached 800) out 100"
+check "the checker sees each atom with the message its quote is from" "$(grep -c '  message (assistant, 2026-01-15): ' "$PROMPT_LOG")" 2
+check "emails and keys are masked before either model call sees them" "$(grep -c 'bob@acme.example\|sk-abcdefghij' "$PROMPT_LOG") $(grep -c '<email>' "$PROMPT_LOG")" "0 3"
 check "tool output never reaches the model" "$(grep -c zebracorn "$PROMPT_LOG")" 0
 out="$(brain search "капибара" --json)"
 check "an atom is searchable and points to its chat" "$(printf '%s' "$out" | field hits 0 key) $(printf '%s' "$out" | field hits 0 atom kind)" "$S5 decision"
@@ -264,7 +276,7 @@ check "--no-atoms: raw units only" "$(keys "капибара" --no-atoms)" ""
 check "an atom is dated by the message it quotes (--before)" "$(keys "капибара" --before 2026-01-15T09:01:30Z)" ""
 check "a misnumbered quote is relinked to the message it is in" "$(brain search "архивариус" --json | field hits 0 atom kind)" "fix"
 check "a second run distills nothing new" "$(brain atoms --source claude | tail -n 1 | grep -o '^atoms: 0 chats')" "atoms: 0 chats"
-check "stats count atoms by kind" "$(brain stats --json | field atoms decision)/$(brain stats --json | field atom_runs dropped)" "1/2"
+check "stats count atoms by kind" "$(brain stats --json | field atoms decision)/$(brain stats --json | field atom_runs dropped)" "1/5"
 out="$(brain eval "$WORK/questions.yaml" --json)"
 check "eval runs with atoms on and can turn them off" "$(printf '%s' "$out" | field atoms) $(brain eval "$WORK/questions.yaml" --no-atoms --json | field atoms)" "True False"
 check "claims default to the chat's language" "$(grep -c "one self-contained sentence in the chat's language" "$PROMPT_LOG")" 1
@@ -273,13 +285,21 @@ cid="$(brain atoms --source claude --redo --dry-run | head -n 1 | awk '{print $1
 printf 'brain_language: "Russian"\n' >> "$HQ/hq.yaml"
 : > "$PROMPT_LOG"
 check "--doc re-distills exactly that chat" "$(brain atoms --source claude --doc "$cid" | tail -n 1 | grep -o '^atoms: 1 chats, 2 kept')" "atoms: 1 chats, 2 kept"
-check "brain_language sets the claims' language" "$(grep -c 'one self-contained sentence in Russian' "$PROMPT_LOG")" 1
+printf 'brain_verify: false\n' >> "$HQ/hq.yaml"
+check "brain_verify: false skips the checker (one call, its «Bob» atom kept)" "$(brain atoms --source claude --doc "$cid" | tail -n 1 | grep -o '1 chats, 3 kept.*1 model calls' | sed 's/,.*·//')" "1 chats 1 model calls"
+sed -i '' '/^brain_verify: false$/d' "$HQ/hq.yaml"
+printf 'brain_verify_model: "python3 %s/model.py --checker"\n' "$WORK" >> "$HQ/hq.yaml"
+brain atoms --source claude --doc "$cid" >/dev/null
+check "brain_verify_model runs the checker with its own command" "$(grep -c 'checker-command' "$PROMPT_LOG")" 1
+sed -i '' '/^brain_verify_model:/d' "$HQ/hq.yaml"
+check "brain_language sets the claims' language (the three runs above)" "$(grep -c 'one self-contained sentence in Russian' "$PROMPT_LOG")" 3
 check "--doc with an unknown id distills nothing" "$(brain atoms --source claude --doc 999999999 | tail -n 1 | grep -o '^atoms: 0 chats')" "atoms: 0 chats"
 printf 'brain_owner: "Ann"\nbrain_relay_markers:\n  - "Continue from"\n' >> "$HQ/hq.yaml"
 : > "$PROMPT_LOG"
 brain atoms --source claude --doc "$cid" >/dev/null
 check "brain_owner names the owner in the prompt" "$(grep -c 'between the owner, Ann (user)' "$PROMPT_LOG")" 1
 check "without a matching marker no message is relayed" "$(grep -c '] relayed ' "$PROMPT_LOG")" 0
+check "an id or number the claim names must be in its message (a year is fine)" "$(cd "$HQ" && python3 -c 'import sys; sys.path.insert(0, "scripts"); import hq_brain as b; print(*b.unsupported_ids("MR !86 влит коммитом e1dd50e9 в 2026, тестов 2801", ["Пайплайн зелёный, вливаю MR !86. Тестов 2 801."], 1767225600))')" "e1dd50e9"
 check "parse_atoms takes the first JSON object when the model repeats it" "$(cd "$HQ" && python3 -c 'import sys; sys.path.insert(0, "scripts"); import hq_brain as b; print(len(b.parse_atoms("{\"atoms\":[{\"kind\":\"fact\"}]}{\"atoms\":[]}")))')" 1
 check "a user message starting with a relay marker is shown as relayed" "$(cd "$HQ" && python3 -c 'import sys; sys.path.insert(0, "scripts"); import hq_brain as b; print(b.render_chat([{"n": 1, "role": "user", "ts": 0, "text": "Continue from x", "shown": "Continue from x"}, {"n": 2, "role": "user", "ts": 0, "text": "ok", "shown": "ok"}], ["Continue from"]).count("relayed"))')" 1
 

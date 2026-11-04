@@ -45,7 +45,10 @@ counts for its source chat and points to the message it quotes. The model is a c
 `agent_message`, usage from `turn.completed`) or as one JSON object with `result` and `usage`.
 `brain_atoms_skip:` — title/first-prompt substrings of chats not worth distilling (automation runs).
 `brain_language:` — the language atoms' claims are written in (default: the chat's own language).
-`brain_owner:` — the owner's name, so claims say who decided. `brain_relay_markers:` — prefixes of user messages
+`brain_verify_model:` — the checker's command (default: `brain_model`; a stronger model catches more).
+`brain_verify:` (default true) — a second model call checks every atom against its message and keeps only
+those it confirms; ids and numbers a claim names must be in its message, and a preference or correction must
+be the owner's own words, verified or not. `brain_owner:` — the owner's name, so claims say who decided. `brain_relay_markers:` — prefixes of user messages
 written by a script, another agent or another person (handoffs, relayed replies); the model sees them as relayed.
 
 Usage:
@@ -1103,7 +1106,9 @@ def atoms_config(hq):
     skip = cfg.get("brain_atoms_skip") or []
     return {"model": cfg.get("brain_model"), "skip": [str(x).lower() for x in (skip if isinstance(skip, list) else [skip])],
             "budget": int(cfg.get("brain_atoms_budget") or ATOM_BUDGET), "lang": cfg.get("brain_language"),
-            "owner": cfg.get("brain_owner"), "relay": [str(x) for x in as_list(cfg.get("brain_relay_markers"))]}
+            "owner": cfg.get("brain_owner"), "relay": [str(x) for x in as_list(cfg.get("brain_relay_markers"))],
+            "verify": str(cfg.get("brain_verify", "true")).lower() not in ("false", "no", "0", "off"),
+            "verify_model": cfg.get("brain_verify_model")}
 
 
 def chat_candidates(db, sources, skip, redo=False, min_turns=2):
@@ -1224,9 +1229,41 @@ def parse_atoms(answer):
     return [x for x in items if isinstance(x, dict)]
 
 
-def check_atoms(items, msgs):
+CLAIM_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b|![0-9]+\b|#\d{3,}\b|\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{7,40}\b"
+                         r"|\b\d{3,}\b")
+OWNER_ONLY = ("preference", "correction")
+
+
+def digits_joined(text):
+    """«2 801» and «2801» compare equal; so do «4,368» and «4368»."""
+    return re.sub(r"(?<=\d)[\s\u00a0\u202f,](?=\d{3}\b)", "", text)
+
+
+def unsupported_ids(claim, support, ts):
+    """Ids, hashes and 3+ digit numbers in the claim that none of the support texts contain.
+    The message's own year is allowed: claims are dated, messages rarely say the year."""
+    year = dt.datetime.fromtimestamp(ts).strftime("%Y") if ts else None
+    hay = digits_joined(" ".join(support)).lower()
+    return [t for t in dict.fromkeys(CLAIM_ID_RE.findall(digits_joined(claim)))
+            if t != year and t.lower() not in hay]
+
+
+def support_texts(msgs, home):
+    """What a claim may draw on: its message, the owner's message before it, the chat's first message."""
+    i = msgs.index(home)
+    before = next((m for m in reversed(msgs[:i]) if m["role"] == "user"), None)
+    first = next((m for m in msgs if m["role"] == "user"), None)
+    return [m["text"] for m in (home, before, first) if m]
+
+
+def is_owner_words(m, relay=()):
+    return m["role"] == "user" and not m["text"].lstrip().startswith(tuple(relay))
+
+
+def check_atoms(items, msgs, relay=()):
     """Keep atoms with a known kind, a claim and a quote found in the input; relink a quote to the
-    message it is really in. Returns (kept, dropped count)."""
+    message it is really in. Drop a claim whose ids or numbers its message does not contain, and a
+    preference or correction that is not the owner's own words. Returns (kept, dropped count)."""
     by_n = {m["n"]: m for m in msgs}
     kept, dropped, claims = [], 0, set()
     for it in items:
@@ -1242,7 +1279,9 @@ def check_atoms(items, msgs):
             n = None
         home = by_n.get(n) if n is not None and by_n.get(n) and quote_in(quote, by_n[n]["text"]) else \
             next((m for m in msgs if quote_in(quote, m["text"])), None)
-        if home is None or norm_quote(claim) in claims:
+        if home is None or norm_quote(claim) in claims or \
+                unsupported_ids(claim, support_texts(msgs, home), home["ts"]) or \
+                (kind in OWNER_ONLY and not is_owner_words(home, relay)):
             dropped += 1
             continue
         claims.add(norm_quote(claim))
@@ -1253,7 +1292,7 @@ def check_atoms(items, msgs):
         except (TypeError, ValueError):
             conf = 0.5
         kept.append({"kind": kind, "claim": claim[:600], "quote": quote[:400], "entities": ents,
-                     "confidence": conf, "unit": home["unit"], "ts": home["ts"]})
+                     "confidence": conf, "unit": home["unit"], "ts": home["ts"], "home": home})
     return kept[:ATOM_MAX], dropped + max(0, len(kept) - ATOM_MAX)
 
 
@@ -1275,6 +1314,85 @@ def store_atoms(db, cid, atoms, model):
                    (aid, stem_text(body), " ".join(extract_ids(body))))
 
 
+VERIFY_PROMPT = """You check knowledge atoms extracted from a chat between the owner, %(owner)s, and an AI agent.
+Each atom comes with the message its quote is from and the owner's message before it. Judge only from that text.
+An atom passes only when ALL hold:
+1. Every statement in the claim is stated in the shown text: no detail, number, id, date, cause or name added
+   from elsewhere or guessed.
+2. The author is right: the owner only for his own words; an agent's report is "the agent"; a relayed message
+   or a task brief belongs to whoever wrote it.
+3. The kind fits: decision = decided or approved; fact = a lasting fact; fix = an error and its fix; preference =
+   a standing wish the owner states himself (not a one-off doubt, not a task's constraint); question = still open;
+   person = a fact about a named person; correction = the owner corrected the agent.
+4. It is worth finding weeks later, not a routine status line ("closing this session", "task stays in progress").
+These slips fail an atom, look for each one:
+- tense: the text says it is being done or planned ("restoring", "will ship"), the claim says it was done;
+- an added purpose, cause or consequence ("in order to", "because", "so that") the text does not state;
+- a name, tag, id or term taken from elsewhere (a task title, a later message) instead of this text;
+- scope stretched: what the text says of one field, case or step, the claim says of several or of all;
+- a contrast or alternative ("instead of X") the text does not mention;
+- a wrong category word for a thing (a project called a channel, a finding called a fix).
+- an agent's own plan, intention or condition ("I'll run it when he merges") called a decision: a decision is
+  what the owner decided or approved, or what was settled, not what the agent means to do next;
+- negation or state flipped: "there was no X, I made it" read as "X already existed", "not done" as "done".
+Fix a claim only by cutting or correcting what the text does not support, in %(lang)s, or fix the kind. If it
+cannot be made exact, or you are unsure, keep=false.
+Return ONLY JSON: {"verdicts":[{"i":N,"keep":true,"claim":null,"kind":null,"why":"short"}]} — one verdict per atom;
+claim/kind null when unchanged.
+
+ATOMS:
+%(atoms)s"""
+
+
+def render_for_check(atoms, msgs, relay=()):
+    blocks = []
+    for i, a in enumerate(atoms, 1):
+        home = a["home"]
+        t, q = home["text"], norm_quote(a["quote"])[:30]
+        pos = norm_quote(t).find(q)
+        start = max(0, int(pos * len(t) / max(1, len(norm_quote(t)))) - 700) if pos >= 0 else 0
+        role = home["role"] if is_owner_words(home, relay) or home["role"] != "user" else "relayed"
+        before = next((m for m in reversed(msgs[:msgs.index(home)]) if m["role"] == "user"), None)
+        day = dt.datetime.fromtimestamp(home["ts"]).strftime("%Y-%m-%d")
+        lines = [f"[{i}] {a['kind']}: {a['claim']}", f"  quote: {a['quote']}",
+                 f"  message ({role}, {day}): {t[start:start + 1600]}"]
+        if before and before is not home:
+            lines.append(f"  owner's message before it: {before['text'][:600]}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def verify_atoms(cmd, atoms, msgs, conf):
+    """A second model call judges each atom against its message; fail closed. Returns (kept, dropped, rec)."""
+    if not atoms:
+        return [], 0, {}
+    prompt = VERIFY_PROMPT % {"owner": conf.get("owner") or "the owner", "lang": conf.get("lang") or "the chat's language",
+                              "atoms": render_for_check(atoms, msgs, conf.get("relay") or ())}
+    answer, usage, secs, err = run_model(conf.get("verify_model") or cmd, prompt)
+    rec = {"chars": len(prompt), "secs": secs, "usage": usage, "error": err}
+    if err:
+        return [], len(atoms), rec
+    try:
+        s = re.sub(r"^```(?:json)?\s*|\s*```$", "", answer.strip())
+        data, _ = json.JSONDecoder().raw_decode(s[s.find("{"):])
+        verdicts = {int(v["i"]): v for v in data.get("verdicts") or [] if isinstance(v, dict) and "i" in v}
+    except (ValueError, TypeError, KeyError):
+        rec["error"] = f"bad verdicts: {answer.strip()[:200]}"
+        return [], len(atoms), rec
+    kept = []
+    for i, a in enumerate(atoms, 1):
+        v = verdicts.get(i)
+        if not v or v.get("keep") is not True:
+            continue
+        claim = " ".join(str(v.get("claim") or a["claim"]).split())[:600]
+        kind = str(v.get("kind") or a["kind"]).strip().lower()
+        if kind not in ATOM_KINDS or unsupported_ids(claim, support_texts(msgs, a["home"]), a["ts"]) or \
+                (kind in OWNER_ONLY and not is_owner_words(a["home"], conf.get("relay") or ())):
+            continue
+        kept.append({**a, "claim": claim, "kind": kind})
+    return kept, len(atoms) - len(kept), rec
+
+
 def distill(cmd, msgs, project=None, conf=None):
     """One model call over one chat → (kept atoms, dropped, run record)."""
     conf = conf or {}
@@ -1291,7 +1409,20 @@ def distill(cmd, msgs, project=None, conf=None):
     except ValueError as exc:
         rec["error"] = f"bad answer: {exc}: {answer.strip()[:200]}"
         return [], 0, rec
-    kept, dropped = check_atoms(items, msgs)
+    kept, dropped = check_atoms(items, msgs, conf.get("relay") or ())
+    if conf.get("verify", True):
+        kept, vdropped, vrec = verify_atoms(cmd, kept, msgs, conf)
+        dropped += vdropped
+        if vrec:
+            rec["calls"] += 1
+            rec["chars"] += vrec["chars"]
+            rec["secs"] += vrec["secs"]
+            for k, src in (("in", "input_tokens"), ("out", "output_tokens")):
+                rec[k] = (rec[k] or 0) + (vrec["usage"].get(src) or 0)
+            vc = vrec["usage"].get("cached_input_tokens") or vrec["usage"].get("cache_read_input_tokens") or 0
+            rec["cached"] = (rec["cached"] or 0) + vc
+            if vrec["error"]:
+                rec["error"] = f"verify: {vrec['error']}"
     return kept, dropped, rec
 
 
@@ -1323,7 +1454,7 @@ def cmd_atoms(args):
         print(f"{len(jobs)} chats would be distilled")
         return 0
     model = conf["model"]
-    t0, totals = time.time(), {"kept": 0, "dropped": 0, "calls": 0, "errors": 0, "in": 0, "cached": 0, "out": 0}
+    t0, totals = time.time(), {"chats": 0, "kept": 0, "dropped": 0, "calls": 0, "errors": 0, "in": 0, "cached": 0, "out": 0}
     with ThreadPoolExecutor(max_workers=max(1, min(args.jobs, 3))) as pool:
         futs = {pool.submit(distill, model, msgs, project, conf): (cid, title) for cid, title, msgs, project in jobs}
         for n, fut in enumerate(as_completed(futs), 1):
@@ -1335,7 +1466,8 @@ def cmd_atoms(args):
                        (cid, time.time(), model, "error" if rec["error"] else "ok", rec["calls"], rec["chars"],
                         rec["in"], rec["cached"], rec["out"], rec["secs"], len(kept), dropped, rec["error"]))
             db.commit()
-            totals["calls"] += 1
+            totals["chats"] += 1
+            totals["calls"] += rec["calls"]
             totals["errors"] += bool(rec["error"])
             totals["kept"] += len(kept)
             totals["dropped"] += dropped
@@ -1350,8 +1482,8 @@ def cmd_atoms(args):
         pass
     db.close()
     wall = time.time() - t0
-    print(f"atoms: {totals['calls']} chats, {totals['kept']} kept, {totals['dropped']} dropped by the checks, "
-          f"{totals['errors']} errors · tokens in {totals['in']} (cached {totals['cached']}) out {totals['out']} · "
+    print(f"atoms: {totals['chats']} chats, {totals['kept']} kept, {totals['dropped']} dropped by the checks, "
+          f"{totals['errors']} errors · {totals['calls']} model calls · tokens in {totals['in']} (cached {totals['cached']}) out {totals['out']} · "
           f"{wall:.0f}s wall")
     return 2 if totals["errors"] else 0
 

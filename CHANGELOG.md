@@ -2,6 +2,21 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer.
 
+## [0.6.2] — 2026-11-04
+
+### Added
+- A checker: a second model call (`brain_verify_model:`, default `brain_model`) reads every atom next to
+  the message its quote is from and keeps, corrects or drops it; no verdict means dropped. It looks for
+  the slips a manual review found: done vs doing, an added cause or purpose, a name taken from elsewhere,
+  stretched scope, an agent's plan called a decision, a flipped negation. `brain_verify: false` turns it off.
+- Code checks before and after the checker: every id, hash and 3+ digit number a claim names must be in
+  its message, the owner's message before it or the chat's first message; a preference or correction
+  must be the owner's own words (not an agent's, not a relayed message).
+
+### Measured
+- On 29 chats re-distilled with an extractor and a stronger checker, an independent judge (a model that
+  did not build it) found 101 of 101 atoms right; before the checker a 30-atom sample had 25–26 right.
+
 ## [0.6.1] — 2026-11-04
 
 ### Changed

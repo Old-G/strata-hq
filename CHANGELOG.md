@@ -2,6 +2,23 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer.
 
+## [0.7.0] — 2026-11-05
+
+### Added
+- `hq_brain.py brief` — what a new chat of a project should know: recent decisions, the owner's corrections and
+  preferences, open questions, error→fix; one line each, a chat never gets its own atoms. For a SessionStart hook.
+- `hq_brain.py hint` — for one message, at most 3 atoms (one per chat) as background, for a UserPromptSubmit hook.
+  An atom must share rare words with the message, some specific (an id with a digit, a capitalised name, a word
+  rare in the raw chats); a message that recalls the past (`brain_recall_cues:`) needs fewer; below
+  `brain_hint_min_score:` only a shared specific id keeps it. Skips diffs, code, `brain_hint_skip:` and relayed
+  messages. `--once FILE` shows an atom once per chat, `--log FILE` writes ms and atom ids per call.
+- `brain_worktree_roots:` — a chat in <root>/<repo folder>/<worktree> counts for the repo's project, also for
+  chats indexed before the setting.
+
+### Measured
+- 439 real owner messages: a hint on 20 (4.6%), p50 5 ms, p95 49 ms in-process (~100 ms with Python start).
+  A second model judged the shown atoms: 18 of 29 on topic (62%), 14 of 20 hints had at least one, 2 misleading.
+
 ## [0.6.3] — 2026-11-05
 
 ### Added

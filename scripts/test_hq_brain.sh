@@ -310,6 +310,33 @@ check "a second questions run asks nothing" "$(brain questions | grep -o '0 chat
 check "parse_atoms takes the first JSON object when the model repeats it" "$(cd "$HQ" && python3 -c 'import sys; sys.path.insert(0, "scripts"); import hq_brain as b; print(len(b.parse_atoms("{\"atoms\":[{\"kind\":\"fact\"}]}{\"atoms\":[]}")))')" 1
 check "a user message starting with a relay marker is shown as relayed" "$(cd "$HQ" && python3 -c 'import sys; sys.path.insert(0, "scripts"); import hq_brain as b; print(b.render_chat([{"n": 1, "role": "user", "ts": 0, "text": "Continue from x", "shown": "Continue from x"}, {"n": 2, "role": "user", "ts": 0, "text": "ok", "shown": "ok"}], ["Continue from"]).count("relayed"))')" 1
 
+echo "== push: brief and hint =="
+NOW=2026-01-20T00:00:00Z
+check "brief: the project's decision, newest first" "$(brain brief --project alpha --now $NOW --json | field lines 0 claim)" "Капибара-бэкап хранится четырнадцать дней."
+check "brief: --cwd finds the project from the chat's folder" "$(brain brief --cwd "$WORK/alpha/src" --now $NOW --json | field project)" "alpha"
+check "brief: only the recent window" "$(brain brief --project alpha --now 2026-06-01T00:00:00Z)" ""
+check "brief: a chat is not told its own atoms" "$(brain brief --project alpha --now $NOW --session "$S5")" ""
+check "brief: text starts with the [brain] label" "$(brain brief --project alpha --now $NOW | head -n 1 | cut -c1-7)" "[brain]"
+mkdir -p "$WORK/wt/alpha/feature-x"
+printf 'brain_worktree_roots:\n  - "%s/wt"\n' "$WORK" >> "$HQ/hq.yaml"
+check "a worktree under brain_worktree_roots counts for its repo's project" "$(brain brief --cwd "$WORK/wt/alpha/feature-x" --now $NOW --json | field project)" "alpha"
+check "…and chats indexed under the worktree's name count too" "$(cd "$HQ" && python3 -c 'import sys; sys.path.insert(0, "scripts"); import hq_brain as b; print("feature-x" in b.project_names(".", "alpha"))')" "True"
+hk() { brain hint "$1" --project alpha "${@:2}" --json | python3 -c 'import json,sys;print(" ".join(h["kind"] for h in json.load(sys.stdin)["hits"]))'; }
+check "hint: everyday words alone bring nothing" "$(hk "сколько хранится бэкап")" ""
+check "hint: one name is not enough for a plain message" "$(hk "сколько Капибара-бэкап хранится")" ""
+printf 'brain_recall_cues:\n  - "мы же"\nbrain_hint_skip:\n  - "Nightly digest"\n' >> "$HQ/hq.yaml"
+check "hint: a weak match stays out (brain_hint_min_score, default 25)" "$(hk "мы же решили, сколько Капибара-бэкап хранится?")" ""
+printf 'brain_hint_min_score: 0\n' >> "$HQ/hq.yaml"   # a three-chat index scores low
+check "hint: a message recalling the past gets the atom" "$(hk "мы же решили, сколько Капибара-бэкап хранится?")" "decision"
+check "hint: not into the chat it came from" "$(hk "мы же решили, сколько Капибара-бэкап хранится?" --session "$S5")" ""
+check "hint: not on an automation's prompt (brain_hint_skip)" "$(hk "Nightly digest: мы же решили, сколько Капибара-бэкап хранится?")" ""
+check "hint: not on a diff" "$(hk "$(printf '+ мы же решили\n+ Капибара-бэкап хранится\n- old\n@@ -1 +1 @@')")" ""
+ONCE="$WORK/once.txt"; LOG="$WORK/hints.jsonl"
+check "hint --once: shown the first time…" "$(hk "мы же решили, сколько Капибара-бэкап хранится?" --once "$ONCE" --log "$LOG")" "decision"
+check "…never twice in one chat" "$(hk "мы же решили, сколько Капибара-бэкап хранится?" --once "$ONCE" --log "$LOG")" ""
+check "hint --log: one line per call with ms" "$(python3 -c 'import json,sys;r=[json.loads(l) for l in open(sys.argv[1])];print(len(r), all("ms" in x for x in r), len(r[0]["atoms"]))' "$LOG")" "2 True 1"
+check "hint text: the label, then the atom with its date" "$(brain hint "мы же решили, сколько Капибара-бэкап хранится?" --project alpha | sed -n 2p)" "- 15.01 · decision: Капибара-бэкап хранится четырнадцать дней."
+
 echo "== config errors =="
 printf 'brain:\n  - name: "nokind"\n' > "$WORK/bad.yaml"; mkdir -p "$WORK/bad"; cp "$WORK/bad.yaml" "$WORK/bad/hq.yaml"
 python3 "$HQ/scripts/hq_brain.py" --hq "$WORK/bad" index >/dev/null 2>&1; check "a source without kind exits 3" "$?" 3

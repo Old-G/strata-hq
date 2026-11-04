@@ -51,6 +51,16 @@ those it confirms; ids and numbers a claim names must be in its message, and a p
 be the owner's own words, verified or not. `brain_owner:` — the owner's name, so claims say who decided. `brain_relay_markers:` — prefixes of user messages
 written by a script, another agent or another person (handoffs, relayed replies); the model sees them as relayed.
 
+Push (layer 4, for hooks): `brief` — what a new chat of a project should know: recent decisions, the owner's
+corrections and preferences, open questions, error→fix (a SessionStart hook prints it). `hint` — for one
+message, at most 3 atoms close enough to put in front of the agent as background (a UserPromptSubmit hook):
+an atom must share rare words with the message, some of them specific (an id with a digit, a name written
+with a capital letter, a word rare in the raw chats). A message that recalls the past — `brain_recall_cues:`,
+regexes in the owner's language — needs fewer. Below `brain_hint_min_score:` (default 25) only a shared
+specific id keeps an atom. `brain_hint_skip:` and `brain_relay_markers:` mark messages
+the owner did not type; diffs and code are skipped too. `brain_worktree_roots:` — folders laid out as
+<root>/<repo folder>/<worktree>: a chat there counts for the repo's project.
+
 Usage:
   python3 scripts/hq_brain.py index  [--hq DIR] [--full] [--source NAME]
   python3 scripts/hq_brain.py questions [--limit N] [--jobs ≤3] [--redo] [--doc ID]
@@ -58,6 +68,8 @@ Usage:
   python3 scripts/hq_brain.py atoms  [--limit 20] [--source NAME ...] [--jobs 1] [--dry-run] [--redo]
   python3 scripts/hq_brain.py eval   questions.yaml [--limit 8] [--no-before] [--json] [--no-atoms]
   python3 scripts/hq_brain.py stats  [--json]
+  python3 scripts/hq_brain.py brief  --project P | --cwd DIR [--session ID ...] [--lines 24] [--json]
+  python3 scripts/hq_brain.py hint   "<message>" --project P | --cwd DIR [--session ID ...] [--once FILE] [--log FILE] [--json]
 Exit: 0 ok · 2 a source failed (the rest was indexed) · 3 bad hq.yaml or no index yet.
 """
 import argparse
@@ -81,7 +93,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hq_registry import read_yaml_subset  # noqa: E402  (same folder)
 from hq_stem import stem, stem_en, translit, words  # noqa: E402
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 SCHEMA = 2
 CHUNK = 2500            # chars per unit; longer messages and sections are split at paragraphs
 MIN_PARA = 60           # a paragraph shorter than this (normalised) is never a "repeat"
@@ -349,6 +361,47 @@ def read_registry(hq):
     return [p for p in reg.get("projects") or [] if isinstance(p, dict) and p.get("path")]
 
 
+def worktree_roots(hq):
+    """`brain_worktree_roots:` — folders laid out as <root>/<repo folder>/<worktree>; such a chat is the repo's."""
+    cfg = read_yaml_subset(os.path.join(hq, "hq.yaml"))
+    return [os.path.expanduser(str(r)).rstrip("/") for r in as_list(cfg.get("brain_worktree_roots"))]
+
+
+def project_of_path(registry, roots, value):
+    """A path → the registry slug of the longest matching project path, or of the repo a worktree belongs
+    to, else the path's basename."""
+    path = os.path.expanduser(str(value)).rstrip("/")
+    best = None
+    for p in registry:
+        root = os.path.expanduser(p["path"]).rstrip("/")
+        if (path == root or path.startswith(root + "/")) and (best is None or len(root) > len(best[0])):
+            best = (root, p.get("slug") or os.path.basename(root))
+    if best:
+        return best[1]
+    for wt in roots:
+        if path.startswith(wt + "/"):
+            repo = path[len(wt) + 1:].split("/")[0]
+            for p in registry:
+                if repo in (os.path.basename(os.path.expanduser(p["path"]).rstrip("/")), p.get("slug")):
+                    return p.get("slug") or repo
+            return repo
+    return os.path.basename(path)
+
+
+def project_names(hq, slug):
+    """The names a project's chats were indexed under: its slug, its folder name and, under each worktree
+    root, the folders of its worktrees (chats indexed before the roots were set carry the worktree name)."""
+    reg = {p.get("slug"): os.path.basename(os.path.expanduser(p["path"]).rstrip("/")) for p in read_registry(hq)}
+    folder = reg.get(slug, slug)
+    names = {slug, folder}
+    for wt in worktree_roots(hq):
+        try:
+            names.update(e.name for e in os.scandir(os.path.join(wt, folder)) if e.is_dir())
+        except OSError:
+            pass
+    return names
+
+
 # ---------------------------------------------------------------- the index
 
 DDL = """
@@ -399,6 +452,7 @@ def connect(path, write=False):
 class Indexer:
     def __init__(self, db, hq, registry):
         self.db, self.hq, self.registry = db, hq, registry
+        self.roots = worktree_roots(hq)
         self.doc_cache = {}
         self.added = 0
         self.pending = 0
@@ -428,19 +482,12 @@ class Indexer:
             self.db.execute("UPDATE docs SET canon=? WHERE id=?", (did, aid))
 
     def project(self, value):
-        """A slug as is; a path → the registry slug of the longest matching project path, else its basename."""
         if not value:
             return None
         value = str(value)
         if not value.startswith(("/", "~")):
             return value
-        path = os.path.expanduser(value)
-        best = None
-        for p in self.registry:
-            root = os.path.expanduser(p["path"]).rstrip("/")
-            if (path == root or path.startswith(root + "/")) and (best is None or len(root) > len(best[0])):
-                best = (root, p.get("slug") or os.path.basename(root))
-        return best[1] if best else os.path.basename(path.rstrip("/"))
+        return project_of_path(self.registry, self.roots, value)
 
     # -- files (incremental unit of the file-based sources)
     def file_state(self, source, path):
@@ -1584,6 +1631,273 @@ def cmd_questions(args):
     return 2 if errors else 0
 
 
+# ---------------------------------------------------------------- push: a brief at chat start, a hint per message
+
+BRIEF = (("decision", 21, 8), ("correction", 90, 5), ("preference", 90, 4), ("question", 21, 5), ("fix", 14, 4))
+BRIEF_TITLE = {"decision": "Decisions", "correction": "The owner corrected the agent", "preference": "The owner's preferences",
+               "question": "Open questions", "fix": "Error → fix"}
+BRIEF_MIN_CHARS = 40    # «the owner chose option 1» says nothing without its chat
+HINT_LIMIT = 3
+HINT_TEXT = 2000        # chars of a message the hint reads (a long paste says what it is about early on)
+HINT_COMMON = 0.02      # a word in more atoms than this share does not count towards a match
+HINT_MIN_MATCH = 2      # distinct rare words of the message an atom must contain (an id counts as two)…
+HINT_SHARE = 0.3        # …and this share of the message's rare words, so a long paste needs more…
+HINT_MAX_NEED = 5       # …but never more than this
+HINT_RAW_RARE = 0.001   # a lowercase word in fewer than this share of raw units is specific (a term, not «коротко»)…
+HINT_SPECIFIC = 2       # …and an atom must share this many specific words, or one id with a digit (DEV-123, !19)
+HINT_PROJECT = 1.5      # an atom of the chat's own project weighs this much more
+HINT_MIN_SCORE = 25.0   # below it only a shared specific id keeps an atom; `brain_hint_min_score:` (bm25 scale:
+                        # set on ~1k atoms and 439 messages judged by a second model — re-check as atoms grow)
+
+
+def session_docs(db, sessions):
+    """Canonical doc ids of the given session keys (a chat's atoms are never pushed back into it)."""
+    keys = [s for s in sessions if s]
+    if not keys:
+        return set()
+    return {r[0] for r in db.execute(
+        f"SELECT COALESCE(canon, id) FROM docs WHERE key IN ({','.join('?' * len(keys))})", keys)}
+
+
+def day(ts):
+    return dt.datetime.fromtimestamp(ts).strftime("%d.%m")
+
+
+def brief(db, names, sessions=(), now=None, max_lines=24):
+    """What a new chat of this project should know: recent decisions, the owner's corrections and
+    preferences, open questions, error→fix — newest first, one line each, no repeats."""
+    if not has_atoms(db) or not names:
+        return []
+    now = now or time.time()
+    skip = session_docs(db, sessions)
+    names = sorted(names)
+    out, seen = [], set()
+    for kind, days, cap in BRIEF:
+        rows = db.execute(
+            "SELECT a.claim, a.ts, COALESCE(d.canon, d.id), d.title FROM atoms a JOIN docs d ON d.id = a.doc "
+            f"WHERE a.kind = ? AND a.superseded_by IS NULL AND a.ts >= ? AND d.project IN ({','.join('?' * len(names))}) "
+            "ORDER BY a.ts DESC", [kind, now - days * 86400, *names]).fetchall()
+        lines = []
+        for claim, ts, canon, title in rows:
+            norm = re.sub(r"\W+", " ", claim.lower())[:80]
+            if canon in skip or norm in seen or len(claim) < BRIEF_MIN_CHARS:
+                continue
+            seen.add(norm)
+            lines.append({"kind": kind, "date": day(ts), "claim": claim, "chat": title})
+            if len(lines) >= cap:
+                break
+        out.extend(lines)
+    return out[:max_lines]
+
+
+DATE_ID_RE = re.compile(r"^\d{1,4}(_\d{1,2}){1,2}(_\d{2,4})?$")   # 04.11, 2026-11-04: dates, not ids
+PLACEHOLDER_RE = re.compile(r"\[(?:Image|Pasted text)[^\]]*\]|/(?:Users|home)/[^/\s]+/", re.I)
+
+
+def hint_terms(db, text):
+    """The message's words and ids that can tie it to an atom: {term: atom df} for stems and for ids
+    (those in more than HINT_COMMON of atoms dropped), and the specific ones among them — ids, names
+    written with a capital letter mid-sentence, and words rare in the raw chats too."""
+    text = PLACEHOLDER_RE.sub(" ", text)
+    ids = [i for i in extract_ids(text) if not DATE_ID_RE.match(i)]
+    id_numbers = {p for i in ids for p in i.split("_") if p.isdigit()}
+    stems, caps = [], set()
+    for m in re.finditer(r"[^\W\d_][\w-]*", text):
+        t = m.group(0).lower()
+        if t in STOP or t in FILLER or t in id_numbers:
+            continue
+        s = stem(t)
+        prev = text[:m.start()]
+        before, after = prev.rstrip(), text[m.end():m.end() + 1]
+        starts = not before or before[-1] in ".!?:;…\"«(/~-—•*>" or "\n" in prev[len(before):]
+        cap = m.group(0)[0].isupper() and not starts and after != "/"
+        if len(s) < (3 if cap else 4):       # «пол», «мен», «эт» match anything; a capitalised «Ann» is a name
+            continue
+        if s not in stems:
+            stems.append(s)
+        if cap:
+            caps.add(s)
+    terms = stems + ids
+    if not terms:
+        return {}, {}, set(), set()
+    marks = ",".join("?" * len(terms))
+    df = dict(db.execute(f"SELECT term, doc FROM atoms_v WHERE term IN ({marks})", terms))
+    raw = dict(db.execute(f"SELECT term, doc FROM fts_v WHERE term IN ({marks})", terms))
+    total = db.execute("SELECT count(*) FROM atoms").fetchone()[0] or 1
+    units = int((db.execute("SELECT v FROM meta WHERE k='units'").fetchone() or [0])[0] or 0) or 1
+    cap = max(2, HINT_COMMON * total)
+    rare = {s: df[s] for s in stems if df.get(s) and df[s] <= cap}
+    rare_ids = {i: df[i] for i in ids if df.get(i) and df[i] <= cap and "https" not in i}
+    rare_raw = HINT_RAW_RARE * units
+    strong = {i for i in rare_ids if re.search(r"\d", i)}
+    specific = {i for i in rare_ids if raw.get(i, 0) <= rare_raw} | {s for s in rare if s in caps or raw.get(s, 0) <= rare_raw}
+    return rare, rare_ids, specific | strong, strong
+
+
+def typed_by_owner(text, skip=()):
+    """False for what the owner did not type: a message starting with a configured marker (an injected
+    notice, a relayed reply), one that contains a skip phrase (an automation's prompt), a diff, or code."""
+    head = text.lstrip()[:400].lower()
+    if any(head.startswith(m.lower()) for m in skip) or any(m.lower() in text[:HINT_TEXT].lower() for m in skip):
+        return False
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    code = sum(1 for ln in lines if re.match(r"\s*([+\-@]{1,3}\s|[{}()\[\];]+$|(def|class|import|from|return|const|let|function|export)\b)", ln))
+    return "=== DIFF" not in text and code / len(lines) < 0.3
+
+
+def recalls(text, cues=()):
+    """True when the message points back at something said before («мы же решили», "didn't we") —
+    `brain_recall_cues:` in hq.yaml, regular expressions in the owner's language."""
+    return any(re.search(c, text[:HINT_TEXT], re.I) for c in cues)
+
+
+def hint(db, text, names=(), sessions=(), before=None, limit=HINT_LIMIT, now=None, cues=(), skip_atoms=(),
+         min_score=HINT_MIN_SCORE):
+    """Atoms worth putting in front of the agent for this message: at most `limit`, one per chat. An
+    atom must share HINT_MIN_MATCH rare words (more for a long message) of which HINT_SPECIFIC are
+    specific, or one id with a digit. When the message recalls the past (`cues`), one specific word is
+    enough — that is when the owner needs the memory most. Empty when nothing is close enough."""
+    if not text or not has_atoms(db):
+        return []
+    rare, ids, specific, strong = hint_terms(db, text[:HINT_TEXT])
+    weight = len(rare) + 2 * len(ids)
+    recall = recalls(text, cues)
+    need = HINT_MIN_MATCH if recall else max(HINT_MIN_MATCH, min(HINT_MAX_NEED, math.ceil(HINT_SHARE * weight)))
+    need_specific = 1 if recall else HINT_SPECIFIC
+    if weight < need or not specific:
+        return []
+    parts = []
+    if rare:
+        parts.append("stem : (" + " OR ".join(fts_quote(s) for s in rare) + ")")
+    if ids:
+        parts.append("ids : (" + " OR ".join(fts_quote(i) for i in ids) + ")")
+    sql = f"SELECT rowid, bm25(atoms_fts, {COLS[0]}, {COLS[1]}) FROM atoms_fts WHERE atoms_fts MATCH ?"
+    params = [" OR ".join(parts)]
+    if before is not None:
+        sql += " AND rowid < ?"
+        params.append(rowid_floor(before))
+    cands = dict(db.execute(sql + " ORDER BY 2 LIMIT 40", params).fetchall())
+    if not cands:
+        return []
+    skip = session_docs(db, sessions)
+    ref = before if before is not None else (now or time.time())
+    scored = []
+    for aid, kind, claim, quote, ents, ts, conf, sup, canon, proj, title, qs in db.execute(
+            "SELECT a.id, a.kind, a.claim, a.quote, a.entities, a.ts, a.confidence, a.superseded_by, "
+            "COALESCE(d.canon, d.id), d.project, d.title, q.questions FROM atoms a JOIN docs d ON d.id = a.doc "
+            "LEFT JOIN atom_questions q ON q.atom = a.id "
+            f"WHERE a.id IN ({','.join('?' * len(cands))})", list(cands)):
+        if sup or canon in skip or aid in skip_atoms or (before is not None and ts >= before):
+            continue
+        body = atom_body(claim, quote, ents, json.loads(qs) if qs else ())
+        have = set(stem_text(body).split())
+        matched = [s for s in rare if s in have]
+        id_hit = [i for i in ids if i in set(extract_ids(body))]
+        if len(matched) + 2 * len(id_hit) < need:
+            continue
+        if not strong.intersection(id_hit) and len(specific.intersection(matched + id_hit)) < need_specific:
+            continue                  # everyday words in common are a coincidence, not a memory
+        half = ATOM_HALF_LIFE.get(kind)
+        age = (ref - ts) / 86400
+        score = -cands[aid] * ATOM_KIND_WEIGHT.get(kind, 1.0) * (0.5 + 0.5 * (conf or 0.5)) \
+            * (0.5 ** (age / half) if half and age > 0 else 1.0) * (HINT_PROJECT if proj in names else 1.0)
+        if score < min_score and not specific.intersection(id_hit):
+            continue                  # a weak match is noise unless the same task, MR or field is named
+        scored.append((score, {"id": aid, "kind": kind, "date": day(ts), "ts": iso(ts), "claim": claim, "chat": title,
+                               "project": proj, "doc": canon, "matched": matched + id_hit, "score": round(score, 3)}))
+    scored.sort(key=lambda x: -x[0])
+    out, docs = [], set()
+    for _, h in scored:
+        if h["doc"] in docs:          # one atom per chat: three from one chat are one memory, not three
+            continue
+        docs.add(h["doc"])
+        out.append(h)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def push_scope(args):
+    """(db, project names, sessions) for brief/hint — the project from --project or from --cwd."""
+    _, path = load_config(args.hq)
+    db = connect(path)
+    slug = args.project or (project_of_path(read_registry(args.hq), worktree_roots(args.hq), args.cwd)
+                            if args.cwd else None)
+    return db, slug, (project_names(args.hq, slug) if slug else set()), args.session or []
+
+
+def cmd_brief(args):
+    try:
+        db, slug, names, sessions = push_scope(args)
+    except FileNotFoundError:
+        return 3
+    lines = brief(db, names, sessions, now=parse_ts(args.now) if args.now else None, max_lines=args.lines)
+    if args.json:
+        print(json.dumps({"project": slug, "lines": lines}, ensure_ascii=False, indent=1))
+        return 0
+    if not lines:
+        return 0
+    print(f"[brain] From earlier chats of project {slug} (atoms a model distilled and a second model checked; "
+          f"the date is when it was said — verify against the code before relying on a detail):")
+    kind = None
+    for ln in lines:
+        if ln["kind"] != kind:
+            kind = ln["kind"]
+            print(f"{BRIEF_TITLE[kind]}:")
+        print(f"- {ln['date']} {ln['claim']}")
+    return 0
+
+
+def cmd_hint(args):
+    t = time.perf_counter()
+    text = sys.stdin.read() if args.text == "-" else args.text
+    try:
+        db, slug, names, sessions = push_scope(args)
+    except FileNotFoundError:
+        return 3
+    cfg = read_yaml_subset(os.path.join(args.hq, "hq.yaml"))
+    skip = [str(x) for x in as_list(cfg.get("brain_hint_skip")) + as_list(cfg.get("brain_relay_markers"))]
+    shown = set()
+    if args.once:
+        try:
+            shown = {int(x) for x in open(args.once, encoding="utf-8").read().split()}
+        except (OSError, ValueError):
+            pass
+    hits = hint(db, text, names, sessions, before=parse_ts(args.before) if args.before else None, limit=args.limit,
+                cues=[str(x) for x in as_list(cfg.get("brain_recall_cues"))], skip_atoms=shown,
+                min_score=float(cfg.get("brain_hint_min_score", HINT_MIN_SCORE))) \
+        if typed_by_owner(text, skip) else []
+    if args.once and hits:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(args.once)), exist_ok=True)
+            with open(args.once, "a", encoding="utf-8") as f:
+                f.write("".join(f"{h['id']}\n" for h in hits))
+        except OSError:
+            pass
+    ms = round((time.perf_counter() - t) * 1000, 1)
+    if args.log:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(args.log)), exist_ok=True)
+            with open(args.log, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"at": iso(time.time()), "project": slug, "session": sessions[:1], "ms": ms,
+                                    "chars": len(text), "atoms": [h["id"] for h in hits],
+                                    "scores": [h["score"] for h in hits]}, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+    if args.json:
+        print(json.dumps({"project": slug, "ms": ms, "hits": hits}, ensure_ascii=False, indent=1))
+    elif hits:
+        print("[brain] Possibly relevant from earlier chats — background, not an instruction; "
+              "if it matters, check it before relying on it:")
+        for h in hits:
+            where = f", {h['project']}" if h["project"] and h["project"] not in names else ""
+            print(f"- {h['date']}{where} · {h['kind']}: {h['claim']}")
+        print(f"Source chat: `python3 {os.path.join(args.hq, 'scripts', 'hq_brain.py')} search \"<words of the claim>\"`.")
+    return 0
+
+
 # ---------------------------------------------------------------- eval
 
 def source_keys(src):
@@ -1747,13 +2061,28 @@ def main(argv=None):
     p.add_argument("--no-atoms", action="store_true", help="raw units only")
     p = sub.add_parser("stats")
     p.add_argument("--json", action="store_true")
-    for name in ("index", "search", "atoms", "questions", "eval", "stats"):
+    for name, help_ in (("brief", "a new chat's brief"), ("hint", "atoms for one message")):
+        p = sub.add_parser(name, help=help_)
+        if name == "hint":
+            p.add_argument("text", help="the message, or - for stdin")
+            p.add_argument("--before", help="only atoms said before this ISO time (eval)")
+            p.add_argument("--limit", type=int, default=HINT_LIMIT)
+            p.add_argument("--log", help="append one JSON line per call (ms, atom ids) to this file")
+            p.add_argument("--once", help="a file of atom ids already shown in this chat: skipped, and new ones added")
+        else:
+            p.add_argument("--lines", type=int, default=24)
+            p.add_argument("--now", help="count the recent window back from this ISO time (default: now)")
+        p.add_argument("--project", help="registry slug")
+        p.add_argument("--cwd", help="the chat's folder, when the slug is not known")
+        p.add_argument("--session", action="append", help="this chat's session key (repeat); its own atoms are skipped")
+        p.add_argument("--json", action="store_true")
+    for name in ("index", "search", "atoms", "questions", "eval", "stats", "brief", "hint"):
         sub.choices[name].add_argument("--hq", default=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     args.hq = os.path.abspath(os.path.expanduser(args.hq))
     try:
         return {"index": cmd_index, "search": cmd_search, "atoms": cmd_atoms, "questions": cmd_questions, "eval": cmd_eval,
-                "stats": cmd_stats}[args.cmd](args)
+                "stats": cmd_stats, "brief": cmd_brief, "hint": cmd_hint}[args.cmd](args)
     except ValueError as exc:
         print(f"hq.yaml: {exc}", file=sys.stderr)
         return 3

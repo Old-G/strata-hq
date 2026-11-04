@@ -60,6 +60,12 @@ write(f"{cl}/{s1}.jsonl", [
 write(f"{cl}/{s2}.jsonl", [user(s2, "2026-01-12T10:00:00Z", paste)])
 # a later chat, with a word only it has
 write(f"{cl}/{s3}.jsonl", [user(s3, "2026-02-20T10:00:00Z", "Маяк lighthouse: проверим в феврале.")])
+# a chat whose rows put "type" first (key order is not fixed)
+s5 = "11111111-aaaa-4aaa-8aaa-000000000005"
+write(f"{cl}/{s5}.jsonl", [{"type": "user", "sessionId": s5, "timestamp": "2026-01-14T10:00:00Z",
+                            "message": {"role": "user", "content": "Ocelot ocelotword first."}},
+                           {"type": "assistant", "sessionId": s5, "timestamp": "2026-01-14T10:01:00Z",
+                            "message": {"role": "assistant", "content": [text("Reply with marmotword.")]}}])
 # a chat that survives only in the zstd archive
 rows = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in [asst(s4, "2026-01-05T08:00:00Z", text("Архивный чат: walrusword."))])
 try:
@@ -140,6 +146,7 @@ check "codex: assistant text in, AGENTS.md and developer text out" "$(keys "peli
 check "a command row is searchable" "$(keys "архив девяносто" --limit 1)" "decisions:d1"
 check "markdown section, dated by git blame" "$(keys "склейка дублей" --before 2026-02-01 --limit 1)" "plans/roadmap.md"
 check "…a section added later is not there before it was written" "$(keys "окапи" --before 2026-02-01)" ""
+check "a row with \"type\" first is still a message" "$(keys "ocelotword") $(keys "marmotword")" "11111111-aaaa-4aaa-8aaa-000000000005 11111111-aaaa-4aaa-8aaa-000000000005"
 check "excluded folders stay out" "$(keys "excludedword")" ""
 check "a file of 1100 sections from one commit (one timestamp) is indexed whole" "$(keys "yakword")" "plans/many.md"
 check "project wikis from the registry" "$(keys "tapir")" "alpha/wiki/index.md"
@@ -192,6 +199,74 @@ check "strict recall: a question finds only what existed before it" "$(printf '%
 check "keywords field runs too" "$(printf '%s' "$out" | field totals keywords strict)/$(printf '%s' "$out" | field totals keywords asked)" "1/1"
 check "without the date filter the later chat counts" "$(brain eval "$WORK/questions.yaml" --no-before --json | field totals typed strict)" 3
 check "latency is reported" "$(printf '%s' "$out" | python3 -c 'import json,sys;l=json.load(sys.stdin)["latency"];print(l["queries"], l["p95_ms"] is not None)')" "4 True"
+
+echo "== atoms =="
+S5=11111111-aaaa-4aaa-8aaa-000000000005; S6=11111111-aaaa-4aaa-8aaa-000000000006
+python3 - "$CL" "$S5" "$S6" <<'PY'
+import json, sys
+cl, s5, s6 = sys.argv[1:]
+def row(sid, kind, ts, text):
+    content = text if kind == "user" else [{"type": "text", "text": text}]
+    return {"parentUuid": None, "isSidechain": False, "type": kind, "sessionId": sid, "cwd": "/work/alpha",
+            "message": {"role": kind, "content": content}, "uuid": f"{kind}-{ts}", "timestamp": ts}
+def write(path, rows):
+    with open(path, "w") as f:
+        for r in rows: f.write(json.dumps(r, ensure_ascii=False) + "\n")
+write(f"{cl}/{s5}.jsonl", [
+    row(s5, "user", "2026-01-15T09:00:00Z", "Пиши Bob на bob@acme.example, ключ sk-abcdefghijklmnopqrstuvwx. Как быть с ночным бэкапом?"),
+    row(s5, "assistant", "2026-01-15T09:01:00Z", "Бэкап падал, потому что диск переполнен; почистил старые снимки, теперь зелёный."),
+    row(s5, "user", "2026-01-15T09:02:00Z", "Хорошо. Решаем так: бэкап храним четырнадцать дней, не больше."),
+    row(s5, "assistant", "2026-01-15T09:03:00Z", "Принято, срок хранения четырнадцать дней."),
+])
+write(f"{cl}/{s6}.jsonl", [
+    row(s6, "user", "2026-01-16T09:00:00Z", "Nightly digest run: собери сводку."),
+    row(s6, "assistant", "2026-01-16T09:01:00Z", "Сводка собрана."),
+    row(s6, "user", "2026-01-16T09:02:00Z", "Ещё раз."),
+    row(s6, "assistant", "2026-01-16T09:03:00Z", "Готово."),
+])
+PY
+cat > "$WORK/model.py" <<'PY'
+# A made-up model: Codex-style JSONL events. Keeps the prompt so the test can see what was sent.
+import json, os, sys
+prompt = sys.stdin.read()
+open(os.environ["PROMPT_LOG"], "a").write(prompt + "\n=====\n")
+atoms = [
+  {"kind": "decision", "claim": "Капибара-бэкап хранится четырнадцать дней.", "quote": "бэкап храним четырнадцать дней, не больше",
+   "msg": 3, "entities": ["backup"], "confidence": 0.9},
+  {"kind": "fix", "claim": "Ночной бэкап падал из-за диска, архивариус почистил снимки.",
+   "quote": "Бэкап падал, потому что диск переполнен", "msg": 1, "entities": [], "confidence": 0.8},
+  {"kind": "fact", "claim": "Придуманный факт.", "quote": "этой фразы в чате нет совсем", "msg": 2, "entities": [], "confidence": 0.9},
+  {"kind": "bogus", "claim": "Неизвестный тип.", "quote": "Принято, срок хранения", "msg": 4},
+]
+print(json.dumps({"type": "thread.started"}))
+print(json.dumps({"type": "item.completed", "item": {"type": "agent_message",
+                  "text": "```json\n" + json.dumps({"atoms": atoms}, ensure_ascii=False) + "\n```"}}))
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1000, "cached_input_tokens": 400, "output_tokens": 50}}))
+PY
+brain index >/dev/null 2>&1
+brain atoms --source claude >/dev/null 2>&1; check "atoms without brain_model exits 3" "$?" 3
+cat >> "$HQ/hq.yaml" <<EOF
+brain_model: "python3 $WORK/model.py"
+brain_atoms_skip:
+  - "nightly digest run"
+EOF
+check "dry run lists the chat, skips the automation run by brain_atoms_skip" "$(brain atoms --source claude --dry-run | tail -n 1)" "1 chats would be distilled"
+export PROMPT_LOG="$WORK/prompt.log"
+out="$(brain atoms --source claude 2>&1)"; check "atoms exits 0" "$?" 0
+check "quote check: 2 kept, 2 dropped (quote not in the chat, unknown kind)" "$(printf '%s\n' "$out" | tail -n 1 | grep -o '1 chats, 2 kept, 2 dropped')" "1 chats, 2 kept, 2 dropped"
+check "tokens are counted" "$(printf '%s\n' "$out" | tail -n 1 | grep -o 'tokens in 1000 (cached 400) out 50')" "tokens in 1000 (cached 400) out 50"
+check "emails and keys are masked before the model sees them" "$(grep -c 'bob@acme.example\|sk-abcdefghij' "$PROMPT_LOG") $(grep -c '<email>' "$PROMPT_LOG")" "0 1"
+check "tool output never reaches the model" "$(grep -c zebracorn "$PROMPT_LOG")" 0
+out="$(brain search "капибара" --json)"
+check "an atom is searchable and points to its chat" "$(printf '%s' "$out" | field hits 0 key) $(printf '%s' "$out" | field hits 0 atom kind)" "$S5 decision"
+check "…with the verbatim quote" "$(printf '%s' "$out" | field hits 0 atom quote)" "бэкап храним четырнадцать дней, не больше"
+check "--no-atoms: raw units only" "$(keys "капибара" --no-atoms)" ""
+check "an atom is dated by the message it quotes (--before)" "$(keys "капибара" --before 2026-01-15T09:01:30Z)" ""
+check "a misnumbered quote is relinked to the message it is in" "$(brain search "архивариус" --json | field hits 0 atom kind)" "fix"
+check "a second run distills nothing new" "$(brain atoms --source claude | tail -n 1 | grep -o '^atoms: 0 chats')" "atoms: 0 chats"
+check "stats count atoms by kind" "$(brain stats --json | field atoms decision)/$(brain stats --json | field atom_runs dropped)" "1/2"
+out="$(brain eval "$WORK/questions.yaml" --json)"
+check "eval runs with atoms on and can turn them off" "$(printf '%s' "$out" | field atoms) $(brain eval "$WORK/questions.yaml" --no-atoms --json | field atoms)" "True False"
 
 echo "== config errors =="
 printf 'brain:\n  - name: "nokind"\n' > "$WORK/bad.yaml"; mkdir -p "$WORK/bad"; cp "$WORK/bad.yaml" "$WORK/bad/hq.yaml"

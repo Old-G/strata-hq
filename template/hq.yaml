@@ -32,3 +32,8 @@ paths:
 #   - kind: "command"                    # anything else: a command printing JSONL units
 #     name: "notes"
 #     run: "python3 scripts/my_notes_source.py"
+# brain_model: "my-model-cli --json -"   # atoms: a command that reads the prompt on stdin and answers
+#                                        # (text, JSONL events with agent_message/usage, or {result, usage})
+# brain_atoms_budget: 12000              # dialogue chars sent per chat
+# brain_atoms_skip:                      # title / first-prompt substrings of chats not worth distilling
+#   - "nightly digest"

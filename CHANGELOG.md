@@ -2,6 +2,27 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer.
 
+## [0.6.0] — 2026-11-04
+
+### Added
+- The brain's atoms (layer 3): `hq_brain.py atoms [--limit N] [--source NAME ...] [--jobs ≤3]
+  [--dry-run] [--redo]` picks chats not yet distilled, newest first (skipping automation runs and
+  titles/prompts listed in `brain_atoms_skip:`), sends the dialogue only — owner and agent text, no
+  tool output, emails / phones / keys masked, cut to `brain_atoms_budget:` chars — to the command
+  in `brain_model:` (prompt on stdin; the model is config, not code) and stores typed atoms:
+  decision · fact · fix · preference · question · person · correction, each with a claim, a
+  verbatim quote, the source message, entities, date, confidence and `superseded_by`.
+- Anti-hallucination check: an atom whose quote is not in the input is dropped (a quote in another
+  message of the chat is relinked to it); counts of kept / dropped, tokens and seconds per chat are
+  kept in `atom_runs` and shown by `stats`.
+- `search` and `eval` rank atoms alongside raw units (an atom hit counts for its source chat and
+  carries `atom` in `--json`); decay by atom kind; `--no-atoms` turns them off for comparison.
+- Tests: a made-up model command, masking, the quote check, relinking, `--before` on atoms.
+
+### Fixed
+- hq_brain.py reads a Claude chat row as a message whatever its key order: a user/assistant row
+  starting with "type" was skipped as metadata.
+
 ## [0.5.0] — 2026-11-04
 
 ### Added

@@ -35,10 +35,21 @@ BM25 × type weight × decay(age, type) — chatter halves every 60 days, errors
 and knowledge never; age counts back from --before (or now). Units are grouped by document (a chat
 session with its aliases, a file, a row) and the top documents come back.
 
+Atoms (layer 3): a model reads one chat's dialogue (owner and agent text, no tool output, masked,
+cut to `brain_atoms_budget` chars) and returns typed claims — decision · fact · fix (error→fix) ·
+preference · question (open) · person (fact about a person) · correction (the owner corrected the
+agent) — each with a verbatim quote. An atom whose quote is not in the input is dropped. Atoms live
+in the same index (table atoms + atoms_fts) and `search` ranks them with the raw units: an atom hit
+counts for its source chat and points to the message it quotes. The model is a command in hq.yaml,
+`brain_model:` — the prompt goes to its stdin; it prints the answer as text, as JSONL events (the last
+`agent_message`, usage from `turn.completed`) or as one JSON object with `result` and `usage`.
+`brain_atoms_skip:` — title/first-prompt substrings of chats not worth distilling (automation runs).
+
 Usage:
   python3 scripts/hq_brain.py index  [--hq DIR] [--full] [--source NAME]
-  python3 scripts/hq_brain.py search "<text>" [--before ISO] [--project P] [--limit 8] [--json]
-  python3 scripts/hq_brain.py eval   questions.yaml [--limit 8] [--no-before] [--json]
+  python3 scripts/hq_brain.py search "<text>" [--before ISO] [--project P] [--limit 8] [--json] [--no-atoms]
+  python3 scripts/hq_brain.py atoms  [--limit 20] [--source NAME ...] [--jobs 1] [--dry-run] [--redo]
+  python3 scripts/hq_brain.py eval   questions.yaml [--limit 8] [--no-before] [--json] [--no-atoms]
   python3 scripts/hq_brain.py stats  [--json]
 Exit: 0 ok · 2 a source failed (the rest was indexed) · 3 bad hq.yaml or no index yet.
 """
@@ -54,14 +65,16 @@ import sqlite3
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hq_registry import read_yaml_subset  # noqa: E402  (same folder)
 from hq_stem import stem, stem_en, translit, words  # noqa: E402
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 SCHEMA = 2
 CHUNK = 2500            # chars per unit; longer messages and sections are split at paragraphs
 MIN_PARA = 60           # a paragraph shorter than this (normalised) is never a "repeat"
@@ -346,6 +359,15 @@ CREATE TABLE IF NOT EXISTS paras(h INTEGER PRIMARY KEY, ts INTEGER, doc INTEGER)
 CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(stem, ids, content='', contentless_delete=1,
   tokenize="unicode61 remove_diacritics 0 tokenchars '_'");
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_v USING fts5vocab(fts, 'row');
+CREATE TABLE IF NOT EXISTS atoms(id INTEGER PRIMARY KEY, doc INTEGER NOT NULL, unit INTEGER, kind TEXT,
+  claim TEXT, quote TEXT, entities TEXT, ts REAL, confidence REAL, superseded_by INTEGER, model TEXT, made REAL);
+CREATE INDEX IF NOT EXISTS atoms_doc ON atoms(doc);
+CREATE TABLE IF NOT EXISTS atom_runs(doc INTEGER PRIMARY KEY, at REAL, model TEXT, status TEXT, calls INTEGER,
+  chars INTEGER, in_tokens INTEGER, cached_tokens INTEGER, out_tokens INTEGER, secs REAL, kept INTEGER,
+  dropped INTEGER, error TEXT);
+CREATE VIRTUAL TABLE IF NOT EXISTS atoms_fts USING fts5(stem, ids, content='', contentless_delete=1,
+  tokenize="unicode61 remove_diacritics 0 tokenchars '_'");
+CREATE VIRTUAL TABLE IF NOT EXISTS atoms_v USING fts5vocab(atoms_fts, 'row');
 """
 
 
@@ -540,7 +562,8 @@ def read_claude(ix, src, path, session, fid):
         lines = open_text(path)
         for line in lines:
             head = line[:40].replace(" ", "")
-            if head.startswith('{"type":"'):      # metadata rows; only titles matter
+            if head.startswith('{"type":"') and not head.startswith(('{"type":"user"', '{"type":"assistant"')):
+                # metadata rows; only titles matter. A message may also put "type" first
                 if head.startswith(('{"type":"ai-title"', '{"type":"summary"')):
                     d = json.loads(line)
                     title = d.get("aiTitle") or d.get("summary") or title
@@ -820,7 +843,7 @@ def cmd_index(args):
 
 # ---------------------------------------------------------------- search
 
-def query_terms(db, text):
+def query_terms(db, text, atoms=False):
     ids = extract_ids(text)
     id_numbers = {p for i in ids for p in i.split("_") if p.isdigit()}   # «!19» means MR 19, not any 19
     stems = []
@@ -840,6 +863,9 @@ def query_terms(db, text):
     if not terms:
         return [], []
     df = dict(db.execute(f"SELECT term, doc FROM fts_v WHERE term IN ({','.join('?' * len(terms))})", terms))
+    if atoms:   # a word only an atom has (a claim's own wording) is still a search term
+        for term, n in db.execute(f"SELECT term, doc FROM atoms_v WHERE term IN ({','.join('?' * len(terms))})", terms):
+            df.setdefault(term, n)
     total = (db.execute("SELECT v FROM meta WHERE k='units'").fetchone() or [None])[0]
     total = int(total) if total else db.execute("SELECT count(*) FROM units").fetchone()[0]
     keep = [s for s in stems + variants if df.get(s)]
@@ -879,9 +905,18 @@ def snippet(text, stems, ids, width=220):
     return ("…" if a else "") + s + ("…" if a + width < len(text) else "")
 
 
-def search(db, text, before=None, project=None, limit=8, now=None):
-    """Top documents for `text`: list of dicts (key, aliases, source, project, title, link, ts, score, snippet)."""
-    stems, ids = query_terms(db, text)
+def has_atoms(db):
+    return bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='atoms_v'").fetchone()) and \
+        bool(db.execute("SELECT 1 FROM atoms LIMIT 1").fetchone())
+
+
+def search(db, text, before=None, project=None, limit=8, now=None, atoms=True):
+    """Top documents for `text`: list of dicts (key, aliases, source, project, title, link, ts, score, snippet).
+
+    With atoms in the index, atom hits rank alongside raw units: each counts for its source chat (its
+    canonical doc), and a hit whose best match is an atom carries it under `atom`."""
+    atoms = atoms and has_atoms(db)
+    stems, ids = query_terms(db, text, atoms)
     if not stems and not ids:
         return []
     parts = []
@@ -898,17 +933,31 @@ def search(db, text, before=None, project=None, limit=8, now=None):
     sql += " ORDER BY r LIMIT ?"
     params.append(pool)
     cands = db.execute(sql, params).fetchall()
-    if not cands:
+    acands = []
+    if atoms:
+        asql = sql.replace("bm25(fts,", "bm25(atoms_fts,").replace("FROM fts WHERE fts MATCH", "FROM atoms_fts WHERE atoms_fts MATCH")
+        acands = db.execute(asql, params[:-1] + [POOL // 4]).fetchall()
+    if not cands and not acands:
         return []
     raw = dict(cands)
     ref = before if before is not None else (now or time.time())
     rows = db.execute(
         "SELECT u.id, u.ts, u.kind, u.weight, u.dup, COALESCE(d.canon, d.id), d.weight FROM units u "
-        f"JOIN docs d ON d.id = u.doc WHERE u.id IN ({','.join('?' * len(raw))})", list(raw)).fetchall()
+        f"JOIN docs d ON d.id = u.doc WHERE u.id IN ({','.join('?' * len(raw))})", list(raw)).fetchall() if raw else []
     by_doc = {}
     for uid, ts, kind, w, dup, canon, dw in rows:
         score = -raw[uid] * (w or 1.0) * (dw or 1.0) * TYPE_WEIGHT.get(kind, 1.0) * decay((ref - ts) / 86400, kind)
         by_doc.setdefault(canon, []).append((score, uid, ts, dup))
+    if acands:
+        araw = dict(acands)
+        for aid, ts, kind, conf, canon, sup in db.execute(
+                "SELECT a.id, a.ts, a.kind, a.confidence, COALESCE(d.canon, d.id), a.superseded_by FROM atoms a "
+                f"JOIN docs d ON d.id = a.doc WHERE a.id IN ({','.join('?' * len(araw))})", list(araw)):
+            w = ATOM_WEIGHT * ATOM_KIND_WEIGHT.get(kind, 1.0) * (0.3 if sup else 1.0) * (0.5 + 0.5 * (conf or 0.5))
+            half = ATOM_HALF_LIFE.get(kind)
+            age = (ref - ts) / 86400
+            score = -araw[aid] * w * (0.5 ** (age / half) if half and age > 0 else 1.0)
+            by_doc.setdefault(canon, []).append((score, -aid, ts, None))   # negative id = an atom
     docs = {r[0]: r for r in db.execute(
         f"SELECT id, key, source, project, title, link FROM docs WHERE id IN ({','.join('?' * len(by_doc))})",
         list(by_doc))}
@@ -925,14 +974,21 @@ def search(db, text, before=None, project=None, limit=8, now=None):
     for score, canon, units in ranked[:limit]:
         _, key, source, proj, title, link = docs[canon]
         best = units[0]
-        body = zlib.decompress(db.execute("SELECT text FROM units WHERE id=?", (best[1],)).fetchone()[0]).decode()
+        atom = None
+        if best[1] < 0:
+            kind, claim, quote, unit = db.execute("SELECT kind, claim, quote, unit FROM atoms WHERE id=?",
+                                                  (-best[1],)).fetchone()
+            atom = {"id": -best[1], "kind": kind, "claim": claim, "quote": quote, "unit": unit}
+            body = f"[{kind}] {claim} — «{quote}»"
+        else:
+            body = zlib.decompress(db.execute("SELECT text FROM units WHERE id=?", (best[1],)).fetchone()[0]).decode()
         aliases = [r[0] for r in db.execute("SELECT key FROM docs WHERE canon=?", (canon,))]
         dup = db.execute("SELECT COALESCE(c.key, d.key) FROM docs d LEFT JOIN docs c ON c.id = d.canon "
                          "WHERE d.id=?", (best[3],)).fetchone() if best[3] else None
         out.append({"rank": len(out) + 1, "key": key, "aliases": aliases, "source": source, "project": proj,
                     "title": title, "link": link, "ts": iso(best[2]), "score": round(score, 4),
                     "units": len(units), "repeat_of": dup[0] if dup else None,
-                    "snippet": snippet(body, stemset, ids)})
+                    "snippet": body if atom else snippet(body, stemset, ids), "atom": atom})
     return out
 
 
@@ -945,7 +1001,7 @@ def cmd_search(args):
         return 3
     before = parse_ts(args.before) if args.before else None
     t = time.perf_counter()
-    hits = search(db, args.text, before=before, project=args.project, limit=args.limit)
+    hits = search(db, args.text, before=before, project=args.project, limit=args.limit, atoms=not args.no_atoms)
     ms = (time.perf_counter() - t) * 1000
     if args.json:
         print(json.dumps({"query": args.text, "before": args.before, "ms": round(ms, 1), "hits": hits},
@@ -958,6 +1014,320 @@ def cmd_search(args):
         print(f"   {h['snippet']}")
     print(f"({len(hits)} hits, {ms:.0f} ms)")
     return 0
+
+
+# ---------------------------------------------------------------- atoms (layer 3: model distills a chat)
+
+ATOM_KINDS = ("decision", "fact", "fix", "preference", "question", "person", "correction")
+ATOM_WEIGHT = 1.5                       # an atom is a distilled claim: it outranks a raw message of equal bm25
+ATOM_KIND_WEIGHT = {"decision": 1.2, "correction": 1.2, "fix": 1.1, "preference": 1.1}
+ATOM_HALF_LIFE = {"question": 60.0, "fix": 180.0, "fact": 365.0}   # the rest never decay, they get superseded
+ATOM_BUDGET = 12000                     # dialogue chars sent per chat
+ATOM_MAX = 8                            # atoms kept per chat
+MSG_CAP = {"user": 700, "assistant": 900}
+MIN_QUOTE = 12
+
+MASKS = [
+    (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"), "<email>"),
+    (re.compile(r"(?<![\w+])\+\d{1,3}[\s().-]*\d[\d\s().-]{6,}\d"), "<phone>"),
+    (re.compile(r"\b8[\s(-]*9\d{2}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}\b"), "<phone>"),
+    (re.compile(r"\b(?:sk-[A-Za-z0-9_-]{16,}|xox[abprse]-[A-Za-z0-9-]{10,}|gh[pousr]_[A-Za-z0-9]{20,}|"
+                r"glpat-[A-Za-z0-9_-]{16,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}|"
+                r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})"), "<token>"),
+    (re.compile(r"(?i)\b((?:api[_-]?key|access[_-]?token|token|secret|password|passwd|pwd)\s*[:=]\s*)[\"']?[^\s\"']{6,}"),
+     r"\1<secret>"),
+    (re.compile(r"\b(?=[A-Za-z0-9+/_-]*[A-Z])(?=[A-Za-z0-9+/_-]*[a-z])(?=[A-Za-z0-9+/_-]*\d)[A-Za-z0-9+/_-]{40,}={0,2}"),
+     "<token>"),
+]
+
+PROMPT = """Extract knowledge atoms from this chat between the owner (user) and an AI agent (assistant).
+Return ONLY JSON: {"atoms":[{"kind":"...","claim":"...","quote":"...","msg":N,"entities":["..."],"confidence":0.0}]}
+kind — one of:
+  decision: something decided, chosen or approved;
+  fact: a lasting fact about a system, project or setup;
+  fix: an error and its fix ("X failed because Y; fixed by Z");
+  preference: how the owner wants things done;
+  question: a question still open at the end of the chat;
+  person: a fact about a named person (role, responsibility, what they asked for);
+  correction: the owner corrected the agent (what was wrong, what is right).
+Rules: 0-%(max)d atoms, only knowledge worth finding weeks later — skip greetings, progress reports, tool noise,
+anything still being guessed. claim: one self-contained sentence in the chat's language, with the names, ids and
+dates it needs to be understood without the chat. quote: 20-200 characters copied VERBATIM from message [msg]
+(same words, same order, no "..."), the part that proves the claim. entities: task ids, projects, people,
+systems, files named. confidence: 0-1, how sure the claim is right and final. No atoms → {"atoms":[]}.
+
+CHAT (project: %(project)s):
+%(chat)s"""
+
+
+def mask(text):
+    for rx, rep in MASKS:
+        text = rx.sub(rep, text)
+    return text
+
+
+def norm_quote(text):
+    text = text.lower().replace("ё", "е")
+    text = re.sub(r"[«»“”„\"'`’‘]", "", text)
+    text = re.sub(r"[—–‑-]", "-", text)
+    text = re.sub(r"[*_#>|]", " ", text)
+    return " ".join(text.split())
+
+
+def quote_in(quote, text):
+    """True when the quote (or each part of it around an ellipsis) appears in text, punctuation-tolerant."""
+    parts = [norm_quote(p) for p in re.split(r"\.\.\.|…", quote)]
+    parts = [p for p in parts if len(p) >= 8] or [norm_quote(quote)]
+    hay = norm_quote(text)
+    return all(p and p in hay for p in parts)
+
+
+def atoms_config(hq):
+    cfg = read_yaml_subset(os.path.join(hq, "hq.yaml"))
+    skip = cfg.get("brain_atoms_skip") or []
+    return {"model": cfg.get("brain_model"), "skip": [str(x).lower() for x in (skip if isinstance(skip, list) else [skip])],
+            "budget": int(cfg.get("brain_atoms_budget") or ATOM_BUDGET)}
+
+
+def chat_candidates(db, sources, skip, redo=False, min_turns=2):
+    """Canonical chat docs worth distilling, newest first: (canon id, title, project)."""
+    marks = ",".join("?" * len(sources))
+    rows = db.execute(f"""
+        SELECT c.id, c.title, c.weight, max(u.ts), sum(u.role='user'), sum(u.role='assistant'), c.project
+        FROM units u JOIN docs d ON d.id = u.doc JOIN docs c ON c.id = COALESCE(d.canon, d.id)
+        WHERE c.source IN ({marks}) AND u.dup IS NULL GROUP BY c.id ORDER BY max(u.ts) DESC""", sources).fetchall()
+    done = {r[0] for r in db.execute("SELECT doc FROM atom_runs WHERE status='ok'")} if not redo else set()
+    out = []
+    for cid, title, weight, last, n_user, n_asst, project in rows:
+        if cid in done or (weight or 1.0) < 1.0 or (n_user or 0) < min_turns or (n_asst or 0) < min_turns:
+            continue
+        if skip:
+            first = db.execute("SELECT u.text FROM units u JOIN docs d ON d.id = u.doc WHERE COALESCE(d.canon, d.id)=? "
+                               "AND u.role='user' ORDER BY u.id LIMIT 1", (cid,)).fetchone()
+            head = ((title or "") + "\n" + (zlib.decompress(first[0]).decode()[:300] if first else "")).lower()
+            if any(p in head for p in skip):
+                continue
+        out.append((cid, title, project))
+    return out
+
+
+def chat_dialogue(db, cid, budget=ATOM_BUDGET):
+    """The chat's messages (masked, capped) within budget: list of dicts n, role, ts, unit, text (full masked)."""
+    rows = db.execute("SELECT u.id, u.ts, u.role, u.text FROM units u JOIN docs d ON d.id = u.doc "
+                      "WHERE COALESCE(d.canon, d.id)=? AND u.dup IS NULL AND u.role IN ('user','assistant') "
+                      "ORDER BY u.ts, u.id", (cid,)).fetchall()
+    msgs, seen = [], set()
+    for uid, ts, role, blob in rows:
+        text = zlib.decompress(blob).decode("utf-8", "replace")
+        if msgs and msgs[-1]["role"] == role and msgs[-1]["ts"] == ts:      # chunks of one message
+            msgs[-1]["text"] += "\n\n" + text
+            continue
+        msgs.append({"role": role, "ts": ts, "unit": uid, "text": text})
+    out = []
+    for m in msgs:
+        key = " ".join(words(m["text"]))[:400]
+        if not key or key in seen:                                        # same message via two sources
+            continue
+        seen.add(key)
+        m["text"] = mask(m["text"].strip())
+        out.append(m)
+    for m in out:
+        cap = MSG_CAP.get(m["role"], 800)
+        m["shown"] = m["text"] if len(m["text"]) <= cap else m["text"][:cap].rstrip() + " […]"
+    # owner turns first, then the agent's from the end (the outcome), until the budget is spent
+    order = [i for i, m in enumerate(out) if m["role"] == "user"] + \
+            [i for i in range(len(out) - 1, -1, -1) if out[i]["role"] != "user"]
+    keep, used = set(), 0
+    for i in order:
+        cost = len(out[i]["shown"]) + 24
+        if used + cost > budget:
+            continue
+        keep.add(i)
+        used += cost
+    picked = [m for i, m in enumerate(out) if i in keep]
+    for n, m in enumerate(picked, 1):
+        m["n"] = n
+    return picked
+
+
+def render_chat(msgs):
+    lines = []
+    for m in msgs:
+        day = dt.datetime.fromtimestamp(m["ts"]).strftime("%Y-%m-%d")
+        lines.append(f"[{m['n']}] {m['role']} {day}: {m['shown']}")
+    return "\n\n".join(lines)
+
+
+def run_model(cmd, prompt, timeout=600):
+    """Run the configured model command with the prompt on stdin, in an empty temp dir.
+    Returns (answer text, usage dict, seconds, error or None)."""
+    t = time.time()
+    with tempfile.TemporaryDirectory(prefix="brain-atoms-") as tmp:
+        try:
+            p = subprocess.run(shlex.split(cmd), input=prompt, capture_output=True, text=True, timeout=timeout,
+                               cwd=tmp, encoding="utf-8", errors="replace")
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return "", {}, time.time() - t, f"{type(exc).__name__}: {exc}"[:300]
+    secs = time.time() - t
+    out, usage, answer = p.stdout or "", {}, None
+    events = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                pass
+    for ev in events:
+        item = ev.get("item") or {}
+        if item.get("type") == "agent_message" and item.get("text"):
+            answer = item["text"]
+        if isinstance(ev.get("usage"), dict):
+            usage = ev["usage"]
+        if isinstance(ev.get("result"), str):
+            answer = ev["result"]
+    if answer is None:
+        answer = out
+    err = None if p.returncode == 0 else f"exit {p.returncode}: {(p.stderr or out).strip()[-300:]}"
+    return answer, usage, secs, err
+
+
+def parse_atoms(answer):
+    s = answer.strip()
+    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s)
+    a, b = s.find("{"), s.rfind("}")
+    if a < 0 or b < a:
+        raise ValueError("no JSON object in the answer")
+    data = json.loads(s[a:b + 1])
+    items = data.get("atoms") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        raise ValueError("`atoms` is not a list")
+    return [x for x in items if isinstance(x, dict)]
+
+
+def check_atoms(items, msgs):
+    """Keep atoms with a known kind, a claim and a quote found in the input; relink a quote to the
+    message it is really in. Returns (kept, dropped count)."""
+    by_n = {m["n"]: m for m in msgs}
+    kept, dropped, claims = [], 0, set()
+    for it in items:
+        kind = str(it.get("kind") or "").strip().lower()
+        claim = " ".join(str(it.get("claim") or "").split())
+        quote = " ".join(str(it.get("quote") or "").split())
+        if kind not in ATOM_KINDS or not claim or len(norm_quote(quote)) < MIN_QUOTE:
+            dropped += 1
+            continue
+        try:
+            n = int(it.get("msg"))
+        except (TypeError, ValueError):
+            n = None
+        home = by_n.get(n) if n is not None and by_n.get(n) and quote_in(quote, by_n[n]["text"]) else \
+            next((m for m in msgs if quote_in(quote, m["text"])), None)
+        if home is None or norm_quote(claim) in claims:
+            dropped += 1
+            continue
+        claims.add(norm_quote(claim))
+        ents = it.get("entities") or []
+        ents = [str(e)[:80] for e in (ents if isinstance(ents, list) else [ents]) if e][:12]
+        try:
+            conf = max(0.0, min(1.0, float(it.get("confidence"))))
+        except (TypeError, ValueError):
+            conf = 0.5
+        kept.append({"kind": kind, "claim": claim[:600], "quote": quote[:400], "entities": ents,
+                     "confidence": conf, "unit": home["unit"], "ts": home["ts"]})
+    return kept[:ATOM_MAX], dropped + max(0, len(kept) - ATOM_MAX)
+
+
+def store_atoms(db, cid, atoms, model):
+    for aid in [r[0] for r in db.execute("SELECT id FROM atoms WHERE doc=?", (cid,))]:
+        db.execute("DELETE FROM atoms_fts WHERE rowid=?", (aid,))
+    db.execute("DELETE FROM atoms WHERE doc=?", (cid,))
+    now = time.time()
+    for a in atoms:
+        base = rowid_floor(a["ts"])
+        top = db.execute("SELECT max(id) FROM atoms WHERE id >= ? AND id < ?", (base, base + SLOTS)).fetchone()[0]
+        aid = base if top is None else top + 1
+        body = " ".join([a["claim"], a["quote"], *a["entities"]])
+        db.execute("INSERT INTO atoms(id, doc, unit, kind, claim, quote, entities, ts, confidence, superseded_by, "
+                   "model, made) VALUES (?,?,?,?,?,?,?,?,?,NULL,?,?)",
+                   (aid, cid, a["unit"], a["kind"], a["claim"], a["quote"], json.dumps(a["entities"], ensure_ascii=False),
+                    a["ts"], a["confidence"], model, now))
+        db.execute("INSERT INTO atoms_fts(rowid, stem, ids) VALUES (?,?,?)",
+                   (aid, stem_text(body), " ".join(extract_ids(body))))
+
+
+def distill(cmd, msgs, project=None):
+    """One model call over one chat → (kept atoms, dropped, run record)."""
+    prompt = PROMPT % {"max": ATOM_MAX, "chat": render_chat(msgs), "project": project or "-"}
+    answer, usage, secs, err = run_model(cmd, prompt)
+    rec = {"calls": 1, "chars": len(prompt), "secs": secs, "in": usage.get("input_tokens"),
+           "cached": usage.get("cached_input_tokens") or usage.get("cache_read_input_tokens"),
+           "out": usage.get("output_tokens"), "error": err}
+    if err:
+        return [], 0, rec
+    try:
+        items = parse_atoms(answer)
+    except ValueError as exc:
+        rec["error"] = f"bad answer: {exc}: {answer.strip()[:200]}"
+        return [], 0, rec
+    kept, dropped = check_atoms(items, msgs)
+    return kept, dropped, rec
+
+
+def cmd_atoms(args):
+    sources, path = load_config(args.hq)
+    conf = atoms_config(args.hq)
+    chat_sources = args.source or [s["name"] for s in sources if s.get("group") == "chat"]
+    if not conf["model"] and not args.dry_run:
+        print("hq.yaml has no `brain_model:` — the command that reads a prompt on stdin and answers", file=sys.stderr)
+        return 3
+    if not os.path.exists(path):
+        print(f"no index at {path} — run `hq_brain.py index` first", file=sys.stderr)
+        return 3
+    db = connect(path, write=True)
+    todo = chat_candidates(db, chat_sources, conf["skip"], redo=args.redo)[:args.limit]
+    jobs = []
+    for cid, title, project in todo:
+        msgs = chat_dialogue(db, cid, conf["budget"])
+        if msgs:
+            jobs.append((cid, title, msgs, project))
+    if args.dry_run:
+        for cid, title, msgs, _ in jobs:
+            print(f"  {cid} · {len(msgs)} msgs · {len(render_chat(msgs))} chars · {(title or '')[:70]}")
+        print(f"{len(jobs)} chats would be distilled")
+        return 0
+    model = conf["model"]
+    t0, totals = time.time(), {"kept": 0, "dropped": 0, "calls": 0, "errors": 0, "in": 0, "cached": 0, "out": 0}
+    with ThreadPoolExecutor(max_workers=max(1, min(args.jobs, 3))) as pool:
+        futs = {pool.submit(distill, model, msgs, project): (cid, title) for cid, title, msgs, project in jobs}
+        for n, fut in enumerate(as_completed(futs), 1):
+            cid, title = futs[fut]
+            kept, dropped, rec = fut.result()
+            if not rec["error"]:
+                store_atoms(db, cid, kept, model)
+            db.execute("INSERT OR REPLACE INTO atom_runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (cid, time.time(), model, "error" if rec["error"] else "ok", rec["calls"], rec["chars"],
+                        rec["in"], rec["cached"], rec["out"], rec["secs"], len(kept), dropped, rec["error"]))
+            db.commit()
+            totals["calls"] += 1
+            totals["errors"] += bool(rec["error"])
+            totals["kept"] += len(kept)
+            totals["dropped"] += dropped
+            for k in ("in", "cached", "out"):
+                totals[k] += rec[k] or 0
+            state = f"error: {rec['error'][:120]}" if rec["error"] else f"{len(kept)} atoms, {dropped} dropped"
+            print(f"  [{n}/{len(jobs)}] {rec['secs']:.0f}s · {state} · {(title or '')[:60]}", flush=True)
+    db.commit()
+    try:
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.OperationalError:   # a reader holds the WAL; the next writer checkpoints
+        pass
+    db.close()
+    wall = time.time() - t0
+    print(f"atoms: {totals['calls']} chats, {totals['kept']} kept, {totals['dropped']} dropped by the checks, "
+          f"{totals['errors']} errors · tokens in {totals['in']} (cached {totals['cached']}) out {totals['out']} · "
+          f"{wall:.0f}s wall")
+    return 2 if totals["errors"] else 0
 
 
 # ---------------------------------------------------------------- eval
@@ -1019,7 +1389,7 @@ def cmd_eval(args):
                 row[label] = None
                 continue
             t = time.perf_counter()
-            hits = search(db, text, before=None if args.no_before else asked, limit=args.limit)
+            hits = search(db, text, before=None if args.no_before else asked, limit=args.limit, atoms=not args.no_atoms)
             times.append((time.perf_counter() - t) * 1000)
             strict = lenient = None
             for h in hits:
@@ -1039,13 +1409,14 @@ def cmd_eval(args):
     lat = {"median_ms": round(statistics.median(times), 1) if times else None,
            "p95_ms": round(times[min(len(times) - 1, math.ceil(0.95 * len(times)) - 1)], 1) if times else None,
            "queries": len(times)}
-    result = {"before_filter": not args.no_before, "limit": args.limit, "totals": totals, "latency": lat,
+    result = {"before_filter": not args.no_before, "atoms": not args.no_atoms, "limit": args.limit, "totals": totals, "latency": lat,
               "questions": rows}
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=1))
         return 0
     n = len(rows)
-    print(f"recall@{args.limit} over {n} questions ({'before asked_at' if not args.no_before else 'no date filter'})")
+    print(f"recall@{args.limit} over {n} questions ({'before asked_at' if not args.no_before else 'no date filter'}"
+          f"{', atoms off' if args.no_atoms else ''})")
     for label, _ in fields:
         t = totals[label]
         print(f"  {label:9s} strict {t['strict']}/{t['asked']} · lenient {t['lenient']}/{t['asked']}")
@@ -1071,12 +1442,20 @@ def cmd_stats(args):
     dups = db.execute("SELECT count(*) FROM units WHERE dup IS NOT NULL").fetchone()[0]
     out = {"index": path, "mb": round(os.path.getsize(path) / 1048576, 1),
            "sources": [{"source": s, "docs": d, "units": u} for s, d, u in per], "repeat_units": dups}
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='atom_runs'").fetchone():
+        out["atoms"] = dict(db.execute("SELECT kind, count(*) FROM atoms GROUP BY 1 ORDER BY 2 DESC").fetchall())
+        r = db.execute("SELECT count(*), sum(status='error'), sum(kept), sum(dropped), sum(in_tokens), "
+                       "sum(cached_tokens), sum(out_tokens), sum(secs) FROM atom_runs").fetchone()
+        out["atom_runs"] = dict(zip(("chats", "errors", "kept", "dropped", "in_tokens", "cached_tokens",
+                                     "out_tokens", "model_secs"), r))
     if args.json:
         print(json.dumps(out, ensure_ascii=False, indent=1))
     else:
         print(f"{path} · {out['mb']} MB · {dups} repeat units")
         for s in out["sources"]:
             print(f"  {s['source']}: {s['docs']} docs, {s['units']} units")
+        if out.get("atom_runs"):
+            print(f"  atoms: {out['atoms']} · runs {out['atom_runs']}")
     return 0
 
 
@@ -1093,19 +1472,28 @@ def main(argv=None):
     p.add_argument("--project")
     p.add_argument("--limit", type=int, default=8)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--no-atoms", action="store_true", help="raw units only")
+    p = sub.add_parser("atoms")
+    p.add_argument("--limit", type=int, default=20, help="chats to distill this run")
+    p.add_argument("--source", action="append", help="chat source name (repeat); default: group chat")
+    p.add_argument("--jobs", type=int, default=1, help="parallel model calls, at most 3")
+    p.add_argument("--dry-run", action="store_true", help="list the chats and prompt sizes, call nothing")
+    p.add_argument("--redo", action="store_true", help="also chats already distilled")
     p = sub.add_parser("eval")
     p.add_argument("questions")
     p.add_argument("--limit", type=int, default=8)
     p.add_argument("--no-before", action="store_true", help="do not hide what was written after the question")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--no-atoms", action="store_true", help="raw units only")
     p = sub.add_parser("stats")
     p.add_argument("--json", action="store_true")
-    for name in ("index", "search", "eval", "stats"):
+    for name in ("index", "search", "atoms", "eval", "stats"):
         sub.choices[name].add_argument("--hq", default=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     args.hq = os.path.abspath(os.path.expanduser(args.hq))
     try:
-        return {"index": cmd_index, "search": cmd_search, "eval": cmd_eval, "stats": cmd_stats}[args.cmd](args)
+        return {"index": cmd_index, "search": cmd_search, "atoms": cmd_atoms, "eval": cmd_eval,
+                "stats": cmd_stats}[args.cmd](args)
     except ValueError as exc:
         print(f"hq.yaml: {exc}", file=sys.stderr)
         return 3

@@ -1339,7 +1339,7 @@ These slips fail an atom, look for each one:
   what the owner decided or approved, or what was settled, not what the agent means to do next;
 - negation or state flipped: "there was no X, I made it" read as "X already existed", "not done" as "done";
 - an object filled in: the text asks to "make it for me too" without naming what, the claim names it;
-- a relay taken for the author: "Orca+ · a message from thread X" is written by the chat X, not by Orca+;
+- a relay taken for the author: "a message from thread X", passed on by a tool, is written by the chat X;
 - a new feature or capability called a fix (a fix needs an error that it corrects);
 - an instruction or condition the owner set called a person fact (that is a decision);
 - a question called open while the chat's end (shown for questions) answers or settles it.

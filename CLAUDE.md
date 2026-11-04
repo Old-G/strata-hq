@@ -8,8 +8,8 @@ personal goes in: no real names, paths, hosts, ids or project names; tests use m
 
 - `.claude-plugin/` — `plugin.json` + `marketplace.json` (this repo is its own marketplace); versions must match.
 - `skills/<name>/SKILL.md` — `init`, `sync`, `garden` (invoked as `/strata-hq:<name>`); descriptions carry EN+RU triggers and a `## Do NOT use when`.
-- `template/` — what `init` copies into a new HQ, including `scripts/hq_registry.py`, `scripts/hq_sync.py` and `scripts/hq_garden.py` (stdlib only).
-- `scripts/` — `validate.sh`, `test_hq_registry.sh`, `test_hq_sync.sh`, `test_hq_garden.sh`.
+- `template/` — what `init` copies into a new HQ, including `scripts/hq_registry.py`, `scripts/hq_sync.py`, `scripts/hq_garden.py`, `scripts/hq_group_chat.py` and the brain's `scripts/hq_brain.py` + `scripts/hq_stem.py` (stdlib only).
+- `scripts/` — `validate.sh`, `test_hq_registry.sh`, `test_hq_sync.sh`, `test_hq_garden.sh`, `test_hq_group_chat.sh`, `test_hq_brain.sh`.
 - `docs/decisions/` — ADRs.
 
 ## Rules

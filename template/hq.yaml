@@ -12,3 +12,23 @@ paths:
 #     path: "~/path/to/hub"
 # trust_ingest_rule: # project PATHS whose own scripts/lib/pending_ingest.sh the gardener may run to
 #   - "~/path/to/project" # count owed ingests (a project may narrow Strata's rule); nobody by default
+# brain_index: "~/.local/share/strata-hq/my-hq/brain.sqlite"   # the brain's index (default: outside git, like this)
+# brain:            # sources of scripts/hq_brain.py (search over chats, notes, wikis; no model)
+#   - kind: "claude-transcripts"
+#     path: "~/.claude/projects"
+#     archive: "~/archive/claude"        # optional: same layout, *.jsonl.zst
+#     group: "chat"                      # repeats collapse within a group
+#   - kind: "codex-sessions"
+#     path: "~/.codex/sessions"
+#     group: "chat"
+#   - kind: "markdown"
+#     name: "hq"
+#     path: "."
+#     exclude: ["chats/"]
+#   - kind: "markdown"
+#     name: "wiki"
+#     registry: true                     # these folders of every local project in registry.yaml
+#     dirs: ["wiki"]
+#   - kind: "command"                    # anything else: a command printing JSONL units
+#     name: "notes"
+#     run: "python3 scripts/my_notes_source.py"

@@ -2,6 +2,25 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer.
 
+## [0.5.0] — 2026-11-04
+
+### Added
+- `template/scripts/hq_brain.py` — the brain's index layer: one local full-text search over agent
+  chats, notes and wikis, with no model. Sources are declared under `brain:` in `hq.yaml`
+  (`claude-transcripts` with an optional `*.jsonl.zst` archive of the same layout,
+  `codex-sessions`, `markdown` folders or every registry project's `wiki/`, and `command` — any
+  program printing JSONL units); the index is SQLite FTS5 at `brain_index:` (default outside git).
+  `index` is incremental (changed files, changed rows); `search` takes a question as typed, with
+  `--before`, `--project`, `--limit`, `--json`; `eval questions.yaml` reports strict and lenient
+  recall@k for the question and its keywords, and median / p95 latency; `stats` per source.
+- `template/scripts/hq_stem.py` — Snowball stemmers for Russian and English in plain Python.
+- Ranking: BM25 over stemmed words plus an unstemmed id column; stopwords and filler dropped;
+  OR semantics; type weights and decay by type (chat 60 days, errors 180, decisions and knowledge
+  never); repeats of an earlier document collapse to a pointer at the first one; chats that open
+  with a repeated prompt (automation runs) weigh less; markdown dated by `git blame`.
+- `scripts/test_hq_brain.sh` with made-up chats, archive, Codex session, command rows, git-dated
+  notes and an eval set; run by `validate.sh`.
+
 ## [0.4.1] — 2026-10-18
 
 ### Security

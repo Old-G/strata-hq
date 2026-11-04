@@ -2,6 +2,18 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer.
 
+## [0.6.3] — 2026-11-05
+
+### Added
+- `hq_brain.py questions` (doc2query): one model call per chat writes 2–3 searches per atom, indexed with it
+  (table `atom_questions`, additive, no schema change).
+- The checker looks for more slips: a filled-in object, a relay taken for the author, a feature called a fix,
+  an instruction called a person fact; a question atom is checked against the chat's end.
+
+### Measured
+- 170 atoms over 60 chats, independent judge: 166 right (98%). Search recall on a 40-question set did not move
+  (24/40 typed, 36/40 keywords): atoms need ranking work before they help search.
+
 ## [0.6.2] — 2026-11-04
 
 ### Added

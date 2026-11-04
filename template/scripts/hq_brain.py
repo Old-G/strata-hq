@@ -53,6 +53,7 @@ written by a script, another agent or another person (handoffs, relayed replies)
 
 Usage:
   python3 scripts/hq_brain.py index  [--hq DIR] [--full] [--source NAME]
+  python3 scripts/hq_brain.py questions [--limit N] [--jobs ≤3] [--redo] [--doc ID]
   python3 scripts/hq_brain.py search "<text>" [--before ISO] [--project P] [--limit 8] [--json] [--no-atoms]
   python3 scripts/hq_brain.py atoms  [--limit 20] [--source NAME ...] [--jobs 1] [--dry-run] [--redo]
   python3 scripts/hq_brain.py eval   questions.yaml [--limit 8] [--no-before] [--json] [--no-atoms]
@@ -374,6 +375,7 @@ CREATE TABLE IF NOT EXISTS atom_runs(doc INTEGER PRIMARY KEY, at REAL, model TEX
 CREATE VIRTUAL TABLE IF NOT EXISTS atoms_fts USING fts5(stem, ids, content='', contentless_delete=1,
   tokenize="unicode61 remove_diacritics 0 tokenchars '_'");
 CREATE VIRTUAL TABLE IF NOT EXISTS atoms_v USING fts5vocab(atoms_fts, 'row');
+CREATE TABLE IF NOT EXISTS atom_questions(atom INTEGER PRIMARY KEY, questions TEXT, model TEXT, made REAL);
 """
 
 
@@ -1299,6 +1301,7 @@ def check_atoms(items, msgs, relay=()):
 def store_atoms(db, cid, atoms, model):
     for aid in [r[0] for r in db.execute("SELECT id FROM atoms WHERE doc=?", (cid,))]:
         db.execute("DELETE FROM atoms_fts WHERE rowid=?", (aid,))
+        db.execute("DELETE FROM atom_questions WHERE atom=?", (aid,))
     db.execute("DELETE FROM atoms WHERE doc=?", (cid,))
     now = time.time()
     for a in atoms:
@@ -1334,7 +1337,12 @@ These slips fail an atom, look for each one:
 - a wrong category word for a thing (a project called a channel, a finding called a fix).
 - an agent's own plan, intention or condition ("I'll run it when he merges") called a decision: a decision is
   what the owner decided or approved, or what was settled, not what the agent means to do next;
-- negation or state flipped: "there was no X, I made it" read as "X already existed", "not done" as "done".
+- negation or state flipped: "there was no X, I made it" read as "X already existed", "not done" as "done";
+- an object filled in: the text asks to "make it for me too" without naming what, the claim names it;
+- a relay taken for the author: "Orca+ · a message from thread X" is written by the chat X, not by Orca+;
+- a new feature or capability called a fix (a fix needs an error that it corrects);
+- an instruction or condition the owner set called a person fact (that is a decision);
+- a question called open while the chat's end (shown for questions) answers or settles it.
 Fix a claim only by cutting or correcting what the text does not support, in %(lang)s, or fix the kind. If it
 cannot be made exact, or you are unsure, keep=false.
 Return ONLY JSON: {"verdicts":[{"i":N,"keep":true,"claim":null,"kind":null,"why":"short"}]} — one verdict per atom;
@@ -1358,6 +1366,10 @@ def render_for_check(atoms, msgs, relay=()):
                  f"  message ({role}, {day}): {t[start:start + 1600]}"]
         if before and before is not home:
             lines.append(f"  owner's message before it: {before['text'][:600]}")
+        if a["kind"] == "question":
+            tail = [m for m in msgs[msgs.index(home) + 1:]][-2:]
+            for m in tail:
+                lines.append(f"  chat's end ({m['role']}): {m['text'][:700]}")
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
 
@@ -1486,6 +1498,90 @@ def cmd_atoms(args):
           f"{totals['errors']} errors · {totals['calls']} model calls · tokens in {totals['in']} (cached {totals['cached']}) out {totals['out']} · "
           f"{wall:.0f}s wall")
     return 2 if totals["errors"] else 0
+
+
+# ---------------------------------------------------------------- questions
+
+QUESTIONS_PROMPT = """These are knowledge atoms from one chat of the owner, %(owner)s, with an AI agent. Weeks later he
+will look for them by typing a short question or a few words. For each atom write 2-3 such searches in %(lang)s,
+the way he would type them: plain words and synonyms the claim does not use, the task id or name when there is
+one, no new facts. Return ONLY JSON: {"questions":[{"i":N,"q":["...","..."]}]}
+
+ATOMS:
+%(atoms)s"""
+
+
+def atom_body(claim, quote, entities_json, questions=()):
+    try:
+        ents = json.loads(entities_json or "[]")
+    except ValueError:
+        ents = []
+    return " ".join([claim or "", quote or "", *[str(e) for e in ents], *questions])
+
+
+def ask_questions(cmd, atoms, conf):
+    """One model call for one chat's atoms → ({atom id: [questions]}, rec)."""
+    listing = "\n".join(f"[{i}] {kind}: {claim}" for i, (_, kind, claim) in enumerate(atoms, 1))
+    prompt = QUESTIONS_PROMPT % {"owner": conf.get("owner") or "the owner",
+                                 "lang": conf.get("lang") or "the chats' language", "atoms": listing}
+    answer, usage, secs, err = run_model(cmd, prompt)
+    rec = {"usage": usage, "secs": secs, "error": err}
+    if err:
+        return {}, rec
+    try:
+        s = re.sub(r"^```(?:json)?\s*|\s*```$", "", answer.strip())
+        data, _ = json.JSONDecoder().raw_decode(s[s.find("{"):])
+        out = {}
+        for item in data.get("questions") or []:
+            i = int(item.get("i"))
+            qs = [" ".join(str(q).split())[:160] for q in (item.get("q") or []) if str(q).strip()][:3]
+            if 1 <= i <= len(atoms) and qs:
+                out[atoms[i - 1][0]] = qs
+        return out, rec
+    except (ValueError, TypeError, AttributeError):
+        rec["error"] = f"bad answer: {answer.strip()[:200]}"
+        return {}, rec
+
+
+def cmd_questions(args):
+    """Doc2query: each atom gets the searches the owner would type, indexed with it."""
+    _, path = load_config(args.hq)
+    conf = atoms_config(args.hq)
+    if not conf["model"]:
+        print("hq.yaml has no `brain_model:`", file=sys.stderr)
+        return 3
+    db = connect(path, write=True)
+    where = "" if args.redo else "AND a.id NOT IN (SELECT atom FROM atom_questions)"
+    rows = db.execute(f"SELECT a.doc, a.id, a.kind, a.claim FROM atoms a WHERE 1=1 {where} ORDER BY a.doc, a.id").fetchall()
+    by_doc = {}
+    for doc, aid, kind, claim in rows:
+        if not args.doc or doc in args.doc:
+            by_doc.setdefault(doc, []).append((aid, kind, claim))
+    jobs = list(by_doc.items())[:args.limit]
+    t0, done, errors, tok = time.time(), 0, 0, {"in": 0, "cached": 0, "out": 0}
+    with ThreadPoolExecutor(max_workers=max(1, min(args.jobs, 3))) as pool:
+        futs = {pool.submit(ask_questions, conf["model"], atoms, conf): doc for doc, atoms in jobs}
+        for fut in as_completed(futs):
+            got, rec = fut.result()
+            errors += bool(rec["error"])
+            u = rec["usage"] or {}
+            tok["in"] += u.get("input_tokens") or 0
+            tok["out"] += u.get("output_tokens") or 0
+            tok["cached"] += u.get("cached_input_tokens") or u.get("cache_read_input_tokens") or 0
+            for aid, qs in got.items():
+                claim, quote, ents = db.execute("SELECT claim, quote, entities FROM atoms WHERE id=?", (aid,)).fetchone()
+                body = atom_body(claim, quote, ents, qs)
+                db.execute("DELETE FROM atoms_fts WHERE rowid=?", (aid,))
+                db.execute("INSERT INTO atoms_fts(rowid, stem, ids) VALUES (?,?,?)",
+                           (aid, stem_text(body), " ".join(extract_ids(body))))
+                db.execute("INSERT OR REPLACE INTO atom_questions VALUES (?,?,?,?)",
+                           (aid, json.dumps(qs, ensure_ascii=False), conf["model"], time.time()))
+                done += 1
+            db.commit()
+    db.close()
+    print(f"questions: {len(jobs)} chats, {done} atoms got questions, {errors} errors · tokens in {tok['in']} "
+          f"(cached {tok['cached']}) out {tok['out']} · {time.time() - t0:.0f}s wall")
+    return 2 if errors else 0
 
 
 # ---------------------------------------------------------------- eval
@@ -1638,6 +1734,11 @@ def main(argv=None):
     p.add_argument("--dry-run", action="store_true", help="list the chats and prompt sizes, call nothing")
     p.add_argument("--redo", action="store_true", help="also chats already distilled")
     p.add_argument("--doc", type=int, action="append", help="only this chat id (repeat); implies --redo")
+    p = sub.add_parser("questions")
+    p.add_argument("--limit", type=int, default=1000, help="chats to cover this run")
+    p.add_argument("--jobs", type=int, default=1, help="parallel model calls, at most 3")
+    p.add_argument("--redo", action="store_true", help="also atoms that already have questions")
+    p.add_argument("--doc", type=int, action="append", help="only this chat id (repeat)")
     p = sub.add_parser("eval")
     p.add_argument("questions")
     p.add_argument("--limit", type=int, default=8)
@@ -1646,12 +1747,12 @@ def main(argv=None):
     p.add_argument("--no-atoms", action="store_true", help="raw units only")
     p = sub.add_parser("stats")
     p.add_argument("--json", action="store_true")
-    for name in ("index", "search", "atoms", "eval", "stats"):
+    for name in ("index", "search", "atoms", "questions", "eval", "stats"):
         sub.choices[name].add_argument("--hq", default=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     args.hq = os.path.abspath(os.path.expanduser(args.hq))
     try:
-        return {"index": cmd_index, "search": cmd_search, "atoms": cmd_atoms, "eval": cmd_eval,
+        return {"index": cmd_index, "search": cmd_search, "atoms": cmd_atoms, "questions": cmd_questions, "eval": cmd_eval,
                 "stats": cmd_stats}[args.cmd](args)
     except ValueError as exc:
         print(f"hq.yaml: {exc}", file=sys.stderr)

@@ -241,7 +241,10 @@ atoms = [
   {"kind": "preference", "claim": "Агент любит короткие сроки.", "quote": "Принято, срок хранения четырнадцать дней", "msg": 4},
   {"kind": "fact", "claim": "Срок хранения согласовали с Bob.", "quote": "Принято, срок хранения четырнадцать дней", "msg": 4},
 ]
-if prompt.startswith("You check knowledge atoms"):
+if "Weeks later he" in prompt:
+    n = len([l for l in prompt.splitlines() if l[:1] == "[" and "]" in l[:5]])
+    answer = {"questions": [{"i": i, "q": ["сколько держим резервные копии", "retention срок"]} for i in range(1, n + 1)]}
+elif prompt.startswith("You check knowledge atoms"):
     # The checker: drops what Bob did not say, retypes nothing, keeps the rest.
     n = len([l for l in prompt.splitlines() if l[:1] == "[" and "]" in l[:5]])
     claims = [l.split(": ", 1)[1] for l in prompt.splitlines() if l[:1] == "[" and "]" in l[:5]]
@@ -300,6 +303,10 @@ brain atoms --source claude --doc "$cid" >/dev/null
 check "brain_owner names the owner in the prompt" "$(grep -c 'between the owner, Ann (user)' "$PROMPT_LOG")" 1
 check "without a matching marker no message is relayed" "$(grep -c '] relayed ' "$PROMPT_LOG")" 0
 check "an id or number the claim names must be in its message (a year is fine)" "$(cd "$HQ" && python3 -c 'import sys; sys.path.insert(0, "scripts"); import hq_brain as b; print(*b.unsupported_ids("MR !86 влит коммитом e1dd50e9 в 2026, тестов 2801", ["Пайплайн зелёный, вливаю MR !86. Тестов 2 801."], 1767225600))')" "e1dd50e9"
+check "before questions, a word only a searcher would type finds no atom" "$(brain search "резервные копии" --json | field hits 0 atom kind 2>/dev/null)" ""
+out="$(brain questions)"; check "questions exits 0 and covers every atom" "$(printf '%s' "$out" | grep -o '1 chats, 2 atoms got questions')" "1 chats, 2 atoms got questions"
+check "an atom is found by its search question" "$(brain search "резервные копии" --json | field hits 0 atom kind)" "decision"
+check "a second questions run asks nothing" "$(brain questions | grep -o '0 chats')" "0 chats"
 check "parse_atoms takes the first JSON object when the model repeats it" "$(cd "$HQ" && python3 -c 'import sys; sys.path.insert(0, "scripts"); import hq_brain as b; print(len(b.parse_atoms("{\"atoms\":[{\"kind\":\"fact\"}]}{\"atoms\":[]}")))')" 1
 check "a user message starting with a relay marker is shown as relayed" "$(cd "$HQ" && python3 -c 'import sys; sys.path.insert(0, "scripts"); import hq_brain as b; print(b.render_chat([{"n": 1, "role": "user", "ts": 0, "text": "Continue from x", "shown": "Continue from x"}, {"n": 2, "role": "user", "ts": 0, "text": "ok", "shown": "ok"}], ["Continue from"]).count("relayed"))')" 1
 

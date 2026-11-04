@@ -2,6 +2,23 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer.
 
+## [0.8.0] — 2026-11-05
+
+### Added
+- `hq_brain.py repeats` — the owner's own messages in a period that recall the past (`brain_repeat_cues:`), each
+  with where the index finds it earlier and whether the hint hook showed anything (`--log`). For daily and
+  weekly reviews: a repeat is the first candidate for a rule.
+- `hq_brain.py persona` — the owner's portrait from atoms: preferences, corrections, people; near-repeats once.
+- `search --role user|assistant`, `--since`; with `--role user` only the owner's own typing: relayed and
+  automation prompts, alias copies of a chat, automation-weighted chats and sources outside
+  `brain_owner_sources:` are left out. JSON output carries `spread` (chats, days, projects).
+- Role `relay` for user-role text a program or another agent wrote: Claude `entrypoint: sdk-cli` runs, `codex
+  exec` sessions, and `role: relay` from a command source. Atoms see it as relayed.
+
+### Fixed
+- A chat re-read after it was distilled (it grew, or `--full`) left its atoms pointing at deleted messages;
+  `index` now relinks each atom to its message by its verbatim quote.
+
 ## [0.7.0] — 2026-11-05
 
 ### Added

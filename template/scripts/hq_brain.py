@@ -15,6 +15,8 @@ outside git). Built-in source kinds:
                       its time is when its oldest line was committed (git blame).
   command             run: a command (cwd = HQ) printing JSONL, one unit per line:
                       {id, text, ts, doc?, title?, project?, link?, kind?, role?, source?, aliases?}
+                      role: user (the owner typed it) · assistant · relay (user-role text someone or
+                      something else wrote — a handoff, a launch prompt: atoms see it as relayed)
                       id is stable; doc groups units (default = id); aliases are other keys of
                       that doc (e.g. a provider's session id); kind: chatter | error | decision |
                       knowledge. BRAIN_SINCE (epoch seconds, 0 = everything) says what the last
@@ -61,6 +63,13 @@ specific id keeps an atom. `brain_hint_skip:` and `brain_relay_markers:` mark me
 the owner did not type; diffs and code are skipped too. `brain_worktree_roots:` — folders laid out as
 <root>/<repo folder>/<worktree>: a chat there counts for the repo's project.
 
+Loops (layer 5): `repeats` — the owner's own messages in a period that recall the past (`brain_repeat_cues:`,
+stricter than the hint's; default `brain_recall_cues:`),
+each with where the index finds it earlier and whether the hint hook showed anything (its --log); the daily
+and weekly reviews turn them into rules with evidence. `persona` — the owner's portrait from atoms
+(preferences, corrections, people), near-repeats once, for a new account or another agent. `search --role
+user` keeps only the owner's own typing (no relayed or launch prompts, no automation prompts) — evidence for a rule.
+
 Usage:
   python3 scripts/hq_brain.py index  [--hq DIR] [--full] [--source NAME]
   python3 scripts/hq_brain.py questions [--limit N] [--jobs ≤3] [--redo] [--doc ID]
@@ -69,6 +78,8 @@ Usage:
   python3 scripts/hq_brain.py eval   questions.yaml [--limit 8] [--no-before] [--json] [--no-atoms]
   python3 scripts/hq_brain.py stats  [--json]
   python3 scripts/hq_brain.py brief  --project P | --cwd DIR [--session ID ...] [--lines 24] [--json]
+  python3 scripts/hq_brain.py repeats [--since ISO] [--until ISO] [--log FILE] [--json]
+  python3 scripts/hq_brain.py persona [--out FILE] [--limit 40] [--json]
   python3 scripts/hq_brain.py hint   "<message>" --project P | --cwd DIR [--session ID ...] [--once FILE] [--log FILE] [--json]
 Exit: 0 ok · 2 a source failed (the rest was indexed) · 3 bad hq.yaml or no index yet.
 """
@@ -93,7 +104,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hq_registry import read_yaml_subset  # noqa: E402  (same folder)
 from hq_stem import stem, stem_en, translit, words  # noqa: E402
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 SCHEMA = 2
 CHUNK = 2500            # chars per unit; longer messages and sections are split at paragraphs
 MIN_PARA = 60           # a paragraph shorter than this (normalised) is never a "repeat"
@@ -633,6 +644,8 @@ def read_claude(ix, src, path, session, fid):
                     or d.get("isCompactSummary") or d.get("toolUseResult"):
                 continue
             cwd = cwd or d.get("cwd")
+            if kind == "user" and d.get("entrypoint") == "sdk-cli":
+                kind = "relay"                   # a print-mode run: the prompt is a program's, not the owner's
             content = (d.get("message") or {}).get("content")
             if isinstance(content, str):
                 text = content
@@ -644,7 +657,7 @@ def read_claude(ix, src, path, session, fid):
             ts = parse_ts(d.get("timestamp"))
             if text and ts:
                 msgs.append((ts, kind, text))
-                if kind == "user" and first_user is None:
+                if kind in ("user", "relay") and first_user is None:
                     first_user = text
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(f"  ! {path}: {exc}", file=sys.stderr)
@@ -655,7 +668,7 @@ def read_claude(ix, src, path, session, fid):
     auto = None
     for ts, role, text in msgs:
         share = ix.add(src, did, ts, text, role=role, file_id=fid)
-        if auto is None and role == "user":
+        if auto is None and role in ("user", "relay"):
             auto = share >= AUTO_SHARE
     ix.db.execute("UPDATE docs SET weight=? WHERE id=?", (AUTO_WEIGHT if auto else 1.0, did))
 
@@ -682,12 +695,13 @@ def index_codex(ix, src, full):
 
 
 def read_codex(ix, src, path, fid):
-    session, cwd, msgs = None, None, []
+    session, cwd, msgs, programmatic = None, None, [], False
     try:
         for line in open_text(path):
             if '"session_meta"' in line[:160]:
                 p = json.loads(line).get("payload") or {}
                 session, cwd = session or p.get("id"), cwd or p.get("cwd")
+                programmatic = programmatic or p.get("originator") == "codex_exec"   # `codex exec`: a program's prompt
                 continue
             if '"response_item"' not in line or '"message"' not in line:
                 continue
@@ -707,14 +721,16 @@ def read_codex(ix, src, path, fid):
         print(f"  ! {path}: {exc}", file=sys.stderr)
     if not msgs:
         return
+    if programmatic:
+        msgs = [(ts, "relay" if role == "user" else role, text) for ts, role, text in msgs]
     session = session or os.path.basename(path)[:-6]
-    first = next((t for _, r, t in msgs if r == "user"), msgs[0][2])
+    first = next((t for _, r, t in msgs if r in ("user", "relay")), msgs[0][2])
     did = ix.doc(session, src["name"], project=cwd or src.get("project"),
                  title=first.strip().splitlines()[0][:100], link=path)
     auto = None
     for ts, role, text in msgs:
         share = ix.add(src, did, ts, text, role=role, file_id=fid)
-        if auto is None and role == "user":
+        if auto is None and role in ("user", "relay"):
             auto = share >= AUTO_SHARE
     ix.db.execute("UPDATE docs SET weight=? WHERE id=?", (AUTO_WEIGHT if auto else 1.0, did))
 
@@ -887,6 +903,9 @@ def cmd_index(args):
             failed += 1
     if ix.added > 50000 or args.full:
         db.execute("INSERT INTO fts(fts) VALUES ('optimize')")
+    relinked = relink_atoms(db)
+    if relinked:
+        print(f"  ✓ atoms: {relinked} relinked to their re-indexed messages")
     db.execute("INSERT OR REPLACE INTO meta VALUES ('indexed_at', ?)", (str(time.time()),))
     db.execute("INSERT OR REPLACE INTO meta VALUES ('units', (SELECT count(*) FROM units))")
     db.commit()
@@ -894,6 +913,27 @@ def cmd_index(args):
     db.close()
     print(f"index: {path} · {os.path.getsize(path) / 1048576:.0f} MB · {time.time() - t0:.0f}s")
     return 2 if failed else 0
+
+
+def relink_atoms(db):
+    """A re-read chat gets new unit ids; each atom finds its message again by its verbatim quote (same
+    chat, closest in time). Returns how many were relinked; one never found keeps unit NULL."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='atoms'").fetchone():
+        return 0
+    lost = db.execute("SELECT a.id, a.quote, a.ts, COALESCE(d.canon, d.id) FROM atoms a JOIN docs d ON d.id = a.doc "
+                      "WHERE a.unit IS NOT NULL AND NOT EXISTS (SELECT 1 FROM units u WHERE u.id = a.unit)").fetchall()
+    fixed = 0
+    for aid, quote, ts, canon in lost:
+        found = None
+        for uid, uts, blob in db.execute(
+                "SELECT u.id, u.ts, u.text FROM units u JOIN docs d ON d.id = u.doc WHERE COALESCE(d.canon, d.id) = ? "
+                "ORDER BY abs(u.ts - ?)", (canon, ts)):
+            if quote_in(quote or "", zlib.decompress(blob).decode("utf-8", "replace")):
+                found = uid
+                break
+        db.execute("UPDATE atoms SET unit=? WHERE id=?", (found, aid))
+        fixed += found is not None
+    return fixed
 
 
 # ---------------------------------------------------------------- search
@@ -960,17 +1000,40 @@ def snippet(text, stems, ids, width=220):
     return ("…" if a else "") + s + ("…" if a + width < len(text) else "")
 
 
+def unit_text(db, uid):
+    return zlib.decompress(db.execute("SELECT text FROM units WHERE id=?", (uid,)).fetchone()[0]).decode()
+
+
+class OwnerMarkers(list):
+    """Markers of text the owner did not type, plus `sources` — the sources he types into (None = all)."""
+    sources = None
+
+
+def owner_markers(hq):
+    """Markers of messages the owner did not type: relayed (`brain_relay_markers:`), automation prompts
+    (`brain_hint_skip:`, `brain_atoms_skip:`); `brain_owner_sources:` — the only sources where he types."""
+    cfg = read_yaml_subset(os.path.join(hq, "hq.yaml"))
+    out = OwnerMarkers(str(x) for k in ("brain_relay_markers", "brain_hint_skip", "brain_atoms_skip")
+                       for x in as_list(cfg.get(k)))
+    out.sources = {str(x) for x in as_list(cfg.get("brain_owner_sources"))} or None
+    return out
+
+
 def has_atoms(db):
     return bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='atoms_v'").fetchone()) and \
         bool(db.execute("SELECT 1 FROM atoms LIMIT 1").fetchone())
 
 
-def search(db, text, before=None, project=None, limit=8, now=None, atoms=True):
+def search(db, text, before=None, project=None, limit=8, now=None, atoms=True, role=None, since=None, exclude=(),
+           owner_skip=None):
     """Top documents for `text`: list of dicts (key, aliases, source, project, title, link, ts, score, snippet).
 
     With atoms in the index, atom hits rank alongside raw units: each counts for its source chat (its
-    canonical doc), and a hit whose best match is an atom carries it under `atom`."""
-    atoms = atoms and has_atoms(db)
+    canonical doc), and a hit whose best match is an atom carries it under `atom`. `role` keeps only units
+    of that role (user = the owner's own words; atoms are then left out), `since` only what was written
+    after it, `exclude` drops these canonical doc ids. `owner_skip` (a list of markers) keeps only messages
+    the owner typed himself — no relayed handoffs, automation prompts, diffs (see typed_by_owner)."""
+    atoms = atoms and not role and has_atoms(db)
     stems, ids = query_terms(db, text, atoms)
     if not stems and not ids:
         return []
@@ -984,7 +1047,7 @@ def search(db, text, before=None, project=None, limit=8, now=None, atoms=True):
     if before is not None:
         sql += " AND rowid < ?"
         params.append(rowid_floor(before))
-    pool = POOL * (5 if project else 1)
+    pool = POOL * (5 if project or role or since else 1)
     sql += " ORDER BY r LIMIT ?"
     params.append(pool)
     cands = db.execute(sql, params).fetchall()
@@ -995,12 +1058,20 @@ def search(db, text, before=None, project=None, limit=8, now=None, atoms=True):
     if not cands and not acands:
         return []
     raw = dict(cands)
+    if not raw and not acands:
+        return []
     ref = before if before is not None else (now or time.time())
     rows = db.execute(
-        "SELECT u.id, u.ts, u.kind, u.weight, u.dup, COALESCE(d.canon, d.id), d.weight FROM units u "
+        "SELECT u.id, u.ts, u.kind, u.weight, u.dup, COALESCE(d.canon, d.id), d.weight, u.role, d.canon, d.source FROM units u "
         f"JOIN docs d ON d.id = u.doc WHERE u.id IN ({','.join('?' * len(raw))})", list(raw)).fetchall() if raw else []
     by_doc = {}
-    for uid, ts, kind, w, dup, canon, dw in rows:
+    owner_sources = getattr(owner_skip, "sources", None)
+    for uid, ts, kind, w, dup, canon, dw, urole, alias, usrc in rows:
+        if (role and urole != role) or (since is not None and ts < since) or canon in exclude:
+            continue
+        if owner_skip is not None and (alias or (dw or 1.0) < 1.0 or (owner_sources and usrc not in owner_sources)
+                                       or not typed_by_owner(unit_text(db, uid), owner_skip)):
+            continue                     # an alias doc is a second copy; its main source knows who typed
         score = -raw[uid] * (w or 1.0) * (dw or 1.0) * TYPE_WEIGHT.get(kind, 1.0) * decay((ref - ts) / 86400, kind)
         by_doc.setdefault(canon, []).append((score, uid, ts, dup))
     if acands:
@@ -1012,7 +1083,11 @@ def search(db, text, before=None, project=None, limit=8, now=None, atoms=True):
             half = ATOM_HALF_LIFE.get(kind)
             age = (ref - ts) / 86400
             score = -araw[aid] * w * (0.5 ** (age / half) if half and age > 0 else 1.0)
+            if (since is not None and ts < since) or canon in exclude:
+                continue
             by_doc.setdefault(canon, []).append((score, -aid, ts, None))   # negative id = an atom
+    if not by_doc:
+        return []
     docs = {r[0]: r for r in db.execute(
         f"SELECT id, key, source, project, title, link FROM docs WHERE id IN ({','.join('?' * len(by_doc))})",
         list(by_doc))}
@@ -1056,10 +1131,14 @@ def cmd_search(args):
         return 3
     before = parse_ts(args.before) if args.before else None
     t = time.perf_counter()
-    hits = search(db, args.text, before=before, project=args.project, limit=args.limit, atoms=not args.no_atoms)
+    hits = search(db, args.text, before=before, project=args.project, limit=args.limit, atoms=not args.no_atoms,
+                  role=args.role, since=parse_ts(args.since) if args.since else None,
+                  owner_skip=owner_markers(args.hq) if args.role == "user" else None)
     ms = (time.perf_counter() - t) * 1000
+    spread = {"chats": len(hits), "days": len({(h["ts"] or "")[:10] for h in hits}),
+              "projects": len({h["project"] for h in hits if h["project"]})}
     if args.json:
-        print(json.dumps({"query": args.text, "before": args.before, "ms": round(ms, 1), "hits": hits},
+        print(json.dumps({"query": args.text, "before": args.before, "ms": round(ms, 1), "spread": spread, "hits": hits},
                          ensure_ascii=False, indent=1))
         return 0
     for h in hits:
@@ -1067,7 +1146,7 @@ def cmd_search(args):
         print(f"   {h['key']}" + (f" (also {', '.join(h['aliases'][:3])})" if h["aliases"] else "")
               + (f" · repeat of {h['repeat_of']}" if h["repeat_of"] else ""))
         print(f"   {h['snippet']}")
-    print(f"({len(hits)} hits, {ms:.0f} ms)")
+    print(f"({len(hits)} hits over {spread['days']} days, {spread['projects']} projects · {ms:.0f} ms)")
     return 0
 
 
@@ -1164,7 +1243,7 @@ def chat_candidates(db, sources, skip, redo=False, min_turns=2):
     """Canonical chat docs worth distilling, newest first: (canon id, title, project)."""
     marks = ",".join("?" * len(sources))
     rows = db.execute(f"""
-        SELECT c.id, c.title, c.weight, max(u.ts), sum(u.role='user'), sum(u.role='assistant'), c.project
+        SELECT c.id, c.title, c.weight, max(u.ts), sum(u.role IN ('user','relay')), sum(u.role='assistant'), c.project
         FROM units u JOIN docs d ON d.id = u.doc JOIN docs c ON c.id = COALESCE(d.canon, d.id)
         WHERE c.source IN ({marks}) AND u.dup IS NULL GROUP BY c.id ORDER BY max(u.ts) DESC""", sources).fetchall()
     done = {r[0] for r in db.execute("SELECT doc FROM atom_runs WHERE status='ok'")} if not redo else set()
@@ -1174,7 +1253,7 @@ def chat_candidates(db, sources, skip, redo=False, min_turns=2):
             continue
         if skip:
             first = db.execute("SELECT u.text FROM units u JOIN docs d ON d.id = u.doc WHERE COALESCE(d.canon, d.id)=? "
-                               "AND u.role='user' ORDER BY u.id LIMIT 1", (cid,)).fetchone()
+                               "AND u.role IN ('user','relay') ORDER BY u.id LIMIT 1", (cid,)).fetchone()
             head = ((title or "") + "\n" + (zlib.decompress(first[0]).decode()[:300] if first else "")).lower()
             if any(p in head for p in skip):
                 continue
@@ -1185,7 +1264,7 @@ def chat_candidates(db, sources, skip, redo=False, min_turns=2):
 def chat_dialogue(db, cid, budget=ATOM_BUDGET):
     """The chat's messages (masked, capped) within budget: list of dicts n, role, ts, unit, text (full masked)."""
     rows = db.execute("SELECT u.id, u.ts, u.role, u.text FROM units u JOIN docs d ON d.id = u.doc "
-                      "WHERE COALESCE(d.canon, d.id)=? AND u.dup IS NULL AND u.role IN ('user','assistant') "
+                      "WHERE COALESCE(d.canon, d.id)=? AND u.dup IS NULL AND u.role IN ('user','assistant','relay') "
                       "ORDER BY u.ts, u.id", (cid,)).fetchall()
     msgs, seen = [], set()
     for uid, ts, role, blob in rows:
@@ -1206,8 +1285,8 @@ def chat_dialogue(db, cid, budget=ATOM_BUDGET):
         cap = MSG_CAP.get(m["role"], 800)
         m["shown"] = m["text"] if len(m["text"]) <= cap else m["text"][:cap].rstrip() + " […]"
     # owner turns first, then the agent's from the end (the outcome), until the budget is spent
-    order = [i for i, m in enumerate(out) if m["role"] == "user"] + \
-            [i for i in range(len(out) - 1, -1, -1) if out[i]["role"] != "user"]
+    order = [i for i, m in enumerate(out) if m["role"] in ("user", "relay")] + \
+            [i for i in range(len(out) - 1, -1, -1) if out[i]["role"] not in ("user", "relay")]
     keep, used = set(), 0
     for i in order:
         cost = len(out[i]["shown"]) + 24
@@ -1226,7 +1305,8 @@ def render_chat(msgs, relay=()):
     lines = []
     for m in msgs:
         day = dt.datetime.fromtimestamp(m["ts"]).strftime("%Y-%m-%d")
-        role = "relayed" if m["role"] == "user" and m["text"].lstrip().startswith(tuple(relay)) else m["role"]
+        role = "relayed" if m["role"] == "relay" or (m["role"] == "user" and m["text"].lstrip().startswith(tuple(relay))) \
+            else m["role"]
         lines.append(f"[{m['n']}] {role} {day}: {m['shown']}")
     return "\n\n".join(lines)
 
@@ -1743,7 +1823,8 @@ def typed_by_owner(text, skip=()):
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if not lines:
         return False
-    code = sum(1 for ln in lines if re.match(r"\s*([+\-@]{1,3}\s|[{}()\[\];]+$|(def|class|import|from|return|const|let|function|export)\b)", ln))
+    code = sum(1 for ln in lines if re.match(
+        r"\s*(\+|@@|-{3}|-(?=\S|\s{2})|[{}()\[\];]+$|(def|class|import|from|return|const|let|function|export)\b)", ln))
     return "=== DIFF" not in text and code / len(lines) < 0.3
 
 
@@ -1858,7 +1939,7 @@ def cmd_hint(args):
     except FileNotFoundError:
         return 3
     cfg = read_yaml_subset(os.path.join(args.hq, "hq.yaml"))
-    skip = [str(x) for x in as_list(cfg.get("brain_hint_skip")) + as_list(cfg.get("brain_relay_markers"))]
+    skip = owner_markers(args.hq)
     shown = set()
     if args.once:
         try:
@@ -1895,6 +1976,119 @@ def cmd_hint(args):
             where = f", {h['project']}" if h["project"] and h["project"] not in names else ""
             print(f"- {h['date']}{where} · {h['kind']}: {h['claim']}")
         print(f"Source chat: `python3 {os.path.join(args.hq, 'scripts', 'hq_brain.py')} search \"<words of the claim>\"`.")
+    return 0
+
+
+# ---------------------------------------------------------------- loops: repeats and persona (layer 5)
+
+PERSONA = (("preference", "How the owner works"), ("correction", "What agents got wrong and the owner corrected"),
+           ("person", "People"))
+PERSONA_CAP = 40
+
+
+def repeats(db, since, until=None, cues=(), owner_skip=(), log=None):
+    """The owner's own messages in [since, until) that point back at something said before (`cues`), each
+    with where the brain finds it earlier and whether the hint hook showed anything for it (`log`)."""
+    until = until or time.time()
+    shown = []
+    if log and os.path.exists(log):
+        for line in open(log, encoding="utf-8"):
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("atoms"):
+                shown.append((parse_ts(rec["at"]), set(rec.get("session") or []), rec["atoms"]))
+    out, seen = [], set()
+    for uid, ts, canon, key, proj, title in db.execute(
+            "SELECT u.id, u.ts, COALESCE(d.canon, d.id), d.key, d.project, d.title FROM units u JOIN docs d ON d.id = u.doc "
+            "WHERE u.role = 'user' AND d.canon IS NULL AND u.ts >= ? AND u.ts < ? ORDER BY u.ts", (since, until)).fetchall():
+        if getattr(owner_skip, "sources", None) and db.execute("SELECT source FROM docs WHERE id=?", (canon,)).fetchone()[0] \
+                not in owner_skip.sources:
+            continue
+        text = unit_text(db, uid)
+        if not recalls(text, cues) or not typed_by_owner(text, owner_skip) or text[:120] in seen:
+            continue
+        seen.add(text[:120])
+        aliases = {key} | {r[0] for r in db.execute("SELECT key FROM docs WHERE canon=?", (canon,))}
+        earlier = search(db, text[:HINT_TEXT], before=ts, limit=2, exclude={canon})
+        hinted = [a for at, sess, atoms in shown if abs(at - ts) <= 180 and sess & aliases for a in atoms]
+        out.append({"at": iso(ts), "project": proj, "chat": title, "key": key, "message": text[:600],
+                     "hinted": hinted,
+                     "earlier": [{k: h[k] for k in ("ts", "project", "title", "key", "snippet")} for h in earlier]})
+    return out
+
+
+def persona(db, cap=PERSONA_CAP):
+    """The owner as the atoms know him: preferences, corrections, people — newest first, near-repeats once."""
+    sections = []
+    for kind, heading in PERSONA:
+        lines, seen = [], []
+        for claim, ts, proj in db.execute(
+                "SELECT a.claim, a.ts, d.project FROM atoms a JOIN docs d ON d.id = a.doc "
+                "WHERE a.kind = ? AND a.superseded_by IS NULL ORDER BY a.ts DESC", (kind,)):
+            stems = set(stem_text(claim).split())
+            if any(len(stems & s) >= 0.6 * max(1, min(len(stems), len(s))) for s in seen):
+                continue                  # the same thing said again in another chat
+            seen.append(stems)
+            lines.append({"claim": claim, "date": dt.datetime.fromtimestamp(ts).strftime("%d.%m.%Y"), "project": proj})
+            if len(lines) >= cap:
+                break
+        sections.append({"kind": kind, "heading": heading, "lines": lines})
+    return sections
+
+
+def cmd_repeats(args):
+    _, path = load_config(args.hq)
+    try:
+        db = connect(path)
+    except FileNotFoundError:
+        return 3
+    cfg = read_yaml_subset(os.path.join(args.hq, "hq.yaml"))
+    since = parse_ts(args.since) if args.since else time.time() - 86400
+    rows = repeats(db, since, parse_ts(args.until) if args.until else None,
+                   cues=[str(x) for x in as_list(cfg.get("brain_repeat_cues") or cfg.get("brain_recall_cues"))],
+                   owner_skip=owner_markers(args.hq),
+                   log=args.log)
+    if args.json:
+        print(json.dumps({"since": iso(since), "count": len(rows), "hinted": sum(bool(r["hinted"]) for r in rows),
+                          "repeats": rows}, ensure_ascii=False, indent=1))
+        return 0
+    for r in rows:
+        print(f"{r['at'][:16]} {r['project'] or '-'}{' · hint shown' if r['hinted'] else ''}: {r['message'][:200]}")
+        for e in r["earlier"]:
+            print(f"   earlier {(e['ts'] or '')[:10]} {e['project'] or '-'} — {e['title']}: {e['snippet'][:160]}")
+    print(f"({len(rows)} messages recalling the past, a hint on {sum(bool(r['hinted']) for r in rows)})")
+    return 0
+
+
+def cmd_persona(args):
+    _, path = load_config(args.hq)
+    try:
+        db = connect(path)
+    except FileNotFoundError:
+        return 3
+    owner = read_yaml_subset(os.path.join(args.hq, "hq.yaml")).get("brain_owner") or "the owner"
+    sections = persona(db, args.limit)
+    if args.json:
+        print(json.dumps(sections, ensure_ascii=False, indent=1))
+        return 0
+    n = db.execute("SELECT count(*) FROM atoms").fetchone()[0]
+    out = [f"# {owner}: portrait from the brain", "",
+           f"Built by `hq_brain.py persona` from {n} atoms (claims distilled from chats and "
+           "checked by a second model). Generated whole — do not edit; the date is when it was said.", ""]
+    for sec in sections:
+        if sec["lines"]:
+            out += [f"## {sec['heading']}", ""] + [f"- {ln['claim']} ({ln['date']}, {ln['project'] or '-'})"
+                                                   for ln in sec["lines"]] + [""]
+    text = "\n".join(out)
+    if args.out:
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"persona: {args.out} · {sum(len(s['lines']) for s in sections)} lines")
+    else:
+        print(text)
     return 0
 
 
@@ -2041,6 +2235,8 @@ def main(argv=None):
     p.add_argument("--limit", type=int, default=8)
     p.add_argument("--json", action="store_true")
     p.add_argument("--no-atoms", action="store_true", help="raw units only")
+    p.add_argument("--role", choices=["user", "assistant"], help="only units of this role (user: the owner's own words)")
+    p.add_argument("--since", help="only what was written after this ISO time")
     p = sub.add_parser("atoms")
     p.add_argument("--limit", type=int, default=20, help="chats to distill this run")
     p.add_argument("--source", action="append", help="chat source name (repeat); default: group chat")
@@ -2076,13 +2272,23 @@ def main(argv=None):
         p.add_argument("--cwd", help="the chat's folder, when the slug is not known")
         p.add_argument("--session", action="append", help="this chat's session key (repeat); its own atoms are skipped")
         p.add_argument("--json", action="store_true")
-    for name in ("index", "search", "atoms", "questions", "eval", "stats", "brief", "hint"):
+    p = sub.add_parser("repeats", help="the owner's messages that recall the past, with where it was said before")
+    p.add_argument("--since", help="ISO time (default: 24 hours ago)")
+    p.add_argument("--until", help="ISO time (default: now)")
+    p.add_argument("--log", help="the hint hook's log, to tell which of them got a hint")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("persona", help="the owner's portrait from atoms: preferences, corrections, people")
+    p.add_argument("--out", help="write markdown here")
+    p.add_argument("--limit", type=int, default=PERSONA_CAP, help="lines per section")
+    p.add_argument("--json", action="store_true")
+    for name in ("index", "search", "atoms", "questions", "eval", "stats", "brief", "hint", "repeats", "persona"):
         sub.choices[name].add_argument("--hq", default=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     args.hq = os.path.abspath(os.path.expanduser(args.hq))
     try:
         return {"index": cmd_index, "search": cmd_search, "atoms": cmd_atoms, "questions": cmd_questions, "eval": cmd_eval,
-                "stats": cmd_stats, "brief": cmd_brief, "hint": cmd_hint}[args.cmd](args)
+                "stats": cmd_stats, "brief": cmd_brief, "hint": cmd_hint, "repeats": cmd_repeats,
+                "persona": cmd_persona}[args.cmd](args)
     except ValueError as exc:
         print(f"hq.yaml: {exc}", file=sys.stderr)
         return 3

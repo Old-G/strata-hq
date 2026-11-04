@@ -337,6 +337,41 @@ check "…never twice in one chat" "$(hk "мы же решили, сколько
 check "hint --log: one line per call with ms" "$(python3 -c 'import json,sys;r=[json.loads(l) for l in open(sys.argv[1])];print(len(r), all("ms" in x for x in r), len(r[0]["atoms"]))' "$LOG")" "2 True 1"
 check "hint text: the label, then the atom with its date" "$(brain hint "мы же решили, сколько Капибара-бэкап хранится?" --project alpha | sed -n 2p)" "- 15.01 · decision: Капибара-бэкап хранится четырнадцать дней."
 
+echo "== loops: owner's words, repeats, persona =="
+S7=11111111-aaaa-4aaa-8aaa-000000000007; S8=11111111-aaaa-4aaa-8aaa-000000000008
+python3 - "$CL" "$S7" "$S8" <<'PY'
+import json, sys
+cl, s7, s8 = sys.argv[1:]
+def row(sid, kind, ts, text, **kw):
+    content = text if kind == "user" else [{"type": "text", "text": text}]
+    return {"parentUuid": None, "isSidechain": False, "type": kind, "sessionId": sid, "cwd": "/work/alpha",
+            "message": {"role": kind, "content": content}, "uuid": f"{kind}-{ts}", "timestamp": ts, **kw}
+def write(path, rows):
+    with open(path, "w") as f:
+        for r in rows: f.write(json.dumps(r, ensure_ascii=False) + "\n")
+write(f"{cl}/{s7}.jsonl", [
+    row(s7, "user", "2026-01-17T09:00:00Z", "Классифицируй: бэкап хранится четырнадцать дней, ответь JSON.", entrypoint="sdk-cli"),
+    row(s7, "assistant", "2026-01-17T09:01:00Z", "{}", entrypoint="sdk-cli")])
+write(f"{cl}/{s8}.jsonl", [
+    row(s8, "user", "2026-01-18T09:00:00Z", "Слушай, мы же решили, сколько храним бэкап? Снова четырнадцать дней обсуждаем."),
+    row(s8, "assistant", "2026-01-18T09:01:00Z", "Да, четырнадцать дней.")])
+PY
+brain index >/dev/null 2>&1
+ukeys() { brain search "$@" --json | python3 -c 'import json,sys;print(" ".join(h["key"] for h in json.load(sys.stdin)["hits"]))'; }
+check "a print-mode run's prompt (entrypoint sdk-cli) is not the owner's words" "$(ukeys "классифицируй" --role user)" ""
+check "…but stays searchable" "$(ukeys "классифицируй" --limit 1)" "$S7"
+check "search --role user --since: the owner's own messages after a time" "$(ukeys "храним четырнадцать" --role user --since 2026-01-16)" "$S8"
+check "search --json: spread over chats, days, projects" "$(brain search "храним четырнадцать" --role user --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["spread"])')" "{'chats': 2, 'days': 2, 'projects': 1}"
+out="$(brain repeats --since 2026-01-18 --until 2026-01-19 --json)"
+check "repeats: the owner's message recalling the past" "$(printf '%s' "$out" | field count) $(printf '%s' "$out" | field repeats 0 key)" "1 $S8"
+check "…with where it was said before" "$(printf '%s' "$out" | field repeats 0 earlier 0 key)" "$S5"
+check "repeats: nothing on a day without such messages" "$(brain repeats --since 2026-01-17 --until 2026-01-18 --json | field count)" "0"
+brain index --full >/dev/null 2>&1
+check "atoms keep their message after a full re-index (relinked by quote)" "$(python3 -c 'import sqlite3,sys;db=sqlite3.connect(sys.argv[1]);print(db.execute("select count(*) from atoms a where a.unit is null or not exists(select 1 from units u where u.id=a.unit)").fetchone()[0])' "$WORK/index/brain.sqlite")" "0"
+check "persona: three sections" "$(brain persona --json | python3 -c 'import json,sys;print(" ".join(s["kind"] for s in json.load(sys.stdin)))')" "preference correction person"
+brain persona --out "$WORK/persona.md" >/dev/null
+check "persona --out writes the portrait" "$(head -n 1 "$WORK/persona.md" | cut -c1-2)" "# "
+
 echo "== config errors =="
 printf 'brain:\n  - name: "nokind"\n' > "$WORK/bad.yaml"; mkdir -p "$WORK/bad"; cp "$WORK/bad.yaml" "$WORK/bad/hq.yaml"
 python3 "$HQ/scripts/hq_brain.py" --hq "$WORK/bad" index >/dev/null 2>&1; check "a source without kind exits 3" "$?" 3

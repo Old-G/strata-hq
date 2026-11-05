@@ -104,7 +104,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hq_registry import read_yaml_subset  # noqa: E402  (same folder)
 from hq_stem import stem, stem_en, translit, words  # noqa: E402
 
-VERSION = "0.8.1"
+VERSION = "0.8.2"
 SCHEMA = 2
 CHUNK = 2500            # chars per unit; longer messages and sections are split at paragraphs
 MIN_PARA = 60           # a paragraph shorter than this (normalised) is never a "repeat"
@@ -1248,13 +1248,15 @@ def chat_candidates(db, sources, skip, redo=False, min_turns=2):
     """Canonical chat docs worth distilling, newest first: (canon id, title, project)."""
     marks = ",".join("?" * len(sources))
     rows = db.execute(f"""
-        SELECT c.id, c.title, c.weight, max(u.ts), sum(u.role IN ('user','relay')), sum(u.role='assistant'), c.project
+        SELECT c.id, c.title, c.weight, max(u.ts), sum(u.role IN ('user','relay')), sum(u.role='assistant'), c.project, sum(u.role='user')
         FROM units u JOIN docs d ON d.id = u.doc JOIN docs c ON c.id = COALESCE(d.canon, d.id)
         WHERE c.source IN ({marks}) AND u.dup IS NULL GROUP BY c.id ORDER BY max(u.ts) DESC""", sources).fetchall()
     done = {r[0] for r in db.execute("SELECT doc FROM atom_runs WHERE status='ok'")} if not redo else set()
     out = []
-    for cid, title, weight, last, n_user, n_asst, project in rows:
+    for cid, title, weight, last, n_user, n_asst, project, n_owner in rows:
         if cid in done or (weight or 1.0) < 1.0 or (n_user or 0) < min_turns or (n_asst or 0) < min_turns:
+            continue
+        if not n_owner:                  # a program's run (every prompt relayed): nothing the owner said
             continue
         if skip:
             first = db.execute("SELECT u.text FROM units u JOIN docs d ON d.id = u.doc WHERE COALESCE(d.canon, d.id)=? "

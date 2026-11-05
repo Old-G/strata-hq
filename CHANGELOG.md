@@ -2,6 +2,11 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer.
 
+## [0.8.2] — 2026-11-05
+
+### Fixed
+- `atoms` skips a chat with no message the owner typed (every prompt relayed — a program's run).
+
 ## [0.8.1] — 2026-11-05
 
 ### Fixed

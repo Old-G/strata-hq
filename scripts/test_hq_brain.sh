@@ -331,6 +331,7 @@ check "hint: a message recalling the past gets the atom" "$(hk "мы же реш
 check "hint: not into the chat it came from" "$(hk "мы же решили, сколько Капибара-бэкап хранится?" --session "$S5")" ""
 check "hint: not on an automation's prompt (brain_hint_skip)" "$(hk "Nightly digest: мы же решили, сколько Капибара-бэкап хранится?")" ""
 check "hint: not on a diff" "$(hk "$(printf '+ мы же решили\n+ Капибара-бэкап хранится\n- old\n@@ -1 +1 @@')")" ""
+check "hint: a recalling message with no atom points to the raw place it was said" "$(brain hint "мы же обсуждали Маяк lighthouse, когда проверим?" --project alpha --json | python3 -c 'import json,sys;h=json.load(sys.stdin)["hits"];print([(x["kind"], x["key"]) for x in h][:1])')" "[('said', '$S3')]"
 ONCE="$WORK/once.txt"; LOG="$WORK/hints.jsonl"
 check "hint --once: shown the first time…" "$(hk "мы же решили, сколько Капибара-бэкап хранится?" --once "$ONCE" --log "$LOG")" "decision"
 check "…never twice in one chat" "$(hk "мы же решили, сколько Капибара-бэкап хранится?" --once "$ONCE" --log "$LOG")" ""
@@ -380,6 +381,11 @@ check "…with where it was said before" "$(printf '%s' "$out" | field repeats 0
 check "repeats: nothing on a day without such messages" "$(brain repeats --since 2026-01-17 --until 2026-01-18 --json | field count)" "0"
 brain index --full >/dev/null 2>&1
 check "atoms keep their message after a full re-index (relinked by quote)" "$(python3 -c 'import sqlite3,sys;db=sqlite3.connect(sys.argv[1]);print(db.execute("select count(*) from atoms a where a.unit is null or not exists(select 1 from units u where u.id=a.unit)").fetchone()[0])' "$WORK/index/brain.sqlite")" "0"
+tl() { brain timeline "$@" --json | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["matched_by"], " ".join(sorted({r["key"] for r in d["rows"]})))'; }
+check "timeline: a task id finds its chat" "$(tl DEV-12345)" "id chat-1"
+check "timeline: a project lists its documents" "$(brain timeline alpha --json | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["matched_by"], len(d["rows"]) > 2)')" "project True"
+check "timeline: a name finds where it is said" "$(tl Ann)" "words chat-1"
+check "timeline: a program's run is left out" "$(tl классифицируй)" "words "
 check "persona: three sections" "$(brain persona --json | python3 -c 'import json,sys;print(" ".join(s["kind"] for s in json.load(sys.stdin)))')" "preference correction person"
 brain persona --out "$WORK/persona.md" >/dev/null
 check "persona --out writes the portrait" "$(head -n 1 "$WORK/persona.md" | cut -c1-2)" "# "

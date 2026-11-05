@@ -80,6 +80,7 @@ Usage:
   python3 scripts/hq_brain.py brief  --project P | --cwd DIR [--session ID ...] [--lines 24] [--json]
   python3 scripts/hq_brain.py repeats [--since ISO] [--until ISO] [--log FILE] [--json]
   python3 scripts/hq_brain.py persona [--out FILE] [--limit 40] [--json]
+  python3 scripts/hq_brain.py timeline "<DEV-123 | !19 | slug | a name>" [--limit 80] [--since ISO] [--json]
   python3 scripts/hq_brain.py hint   "<message>" --project P | --cwd DIR [--session ID ...] [--once FILE] [--log FILE] [--json]
 Exit: 0 ok · 2 a source failed (the rest was indexed) · 3 bad hq.yaml or no index yet.
 """
@@ -104,7 +105,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hq_registry import read_yaml_subset  # noqa: E402  (same folder)
 from hq_stem import stem, stem_en, translit, words  # noqa: E402
 
-VERSION = "0.8.2"
+VERSION = "0.9.0"
 SCHEMA = 2
 CHUNK = 2500            # chars per unit; longer messages and sections are split at paragraphs
 MIN_PARA = 60           # a paragraph shorter than this (normalised) is never a "repeat"
@@ -422,6 +423,7 @@ CREATE TABLE IF NOT EXISTS docs(id INTEGER PRIMARY KEY, key TEXT UNIQUE NOT NULL
 CREATE TABLE IF NOT EXISTS units(id INTEGER PRIMARY KEY, doc INTEGER NOT NULL, file INTEGER, msg INTEGER,
   ts REAL, role TEXT, kind TEXT, weight REAL, dup INTEGER, chash INTEGER, text BLOB);
 CREATE INDEX IF NOT EXISTS units_doc ON units(doc);
+CREATE INDEX IF NOT EXISTS docs_canon ON docs(canon) WHERE canon IS NOT NULL;
 CREATE INDEX IF NOT EXISTS units_file ON units(file) WHERE file IS NOT NULL;
 CREATE INDEX IF NOT EXISTS units_msg ON units(msg) WHERE msg IS NOT NULL;
 CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, source TEXT NOT NULL, path TEXT NOT NULL, stamp TEXT,
@@ -1030,7 +1032,7 @@ def has_atoms(db):
 
 
 def search(db, text, before=None, project=None, limit=8, now=None, atoms=True, role=None, since=None, exclude=(),
-           owner_skip=None):
+           owner_skip=None, pool=None, terms=None):
     """Top documents for `text`: list of dicts (key, aliases, source, project, title, link, ts, score, snippet).
 
     With atoms in the index, atom hits rank alongside raw units: each counts for its source chat (its
@@ -1039,7 +1041,7 @@ def search(db, text, before=None, project=None, limit=8, now=None, atoms=True, r
     after it, `exclude` drops these canonical doc ids. `owner_skip` (a list of markers) keeps only messages
     the owner typed himself — no relayed handoffs, automation prompts, diffs (see typed_by_owner)."""
     atoms = atoms and not role and has_atoms(db)
-    stems, ids = query_terms(db, text, atoms)
+    stems, ids = terms or query_terms(db, text, atoms)
     if not stems and not ids:
         return []
     parts = []
@@ -1052,7 +1054,7 @@ def search(db, text, before=None, project=None, limit=8, now=None, atoms=True, r
     if before is not None:
         sql += " AND rowid < ?"
         params.append(rowid_floor(before))
-    pool = POOL * (5 if project or role or since else 1)
+    pool = pool or POOL * (5 if project or role or since else 1)
     sql += " ORDER BY r LIMIT ?"
     params.append(pool)
     cands = db.execute(sql, params).fetchall()
@@ -1122,6 +1124,7 @@ def search(db, text, before=None, project=None, limit=8, now=None, atoms=True, r
                          "WHERE d.id=?", (best[3],)).fetchone() if best[3] else None
         out.append({"rank": len(out) + 1, "key": key, "aliases": aliases, "source": source, "project": proj,
                     "title": title, "link": link, "ts": iso(best[2]), "score": round(score, 4),
+                    "unit": best[1] if best[1] > 0 else None,
                     "units": len(units), "repeat_of": dup[0] if dup else None,
                     "snippet": body if atom else snippet(body, stemset, ids), "atom": atom})
     return out
@@ -1785,7 +1788,7 @@ DATE_ID_RE = re.compile(r"^\d{1,4}(_\d{1,2}){1,2}(_\d{2,4})?$")   # 04.11, 2026-
 PLACEHOLDER_RE = re.compile(r"\[(?:Image|Pasted text)[^\]]*\]|/(?:Users|home)/[^/\s]+/", re.I)
 
 
-def hint_terms(db, text):
+def hint_terms(db, text, vocab="atoms_v"):
     """The message's words and ids that can tie it to an atom: {term: atom df} for stems and for ids
     (those in more than HINT_COMMON of atoms dropped), and the specific ones among them — ids, names
     written with a capital letter mid-sentence, and words rare in the raw chats too."""
@@ -1812,10 +1815,10 @@ def hint_terms(db, text):
     if not terms:
         return {}, {}, set(), set()
     marks = ",".join("?" * len(terms))
-    df = dict(db.execute(f"SELECT term, doc FROM atoms_v WHERE term IN ({marks})", terms))
+    df = dict(db.execute(f"SELECT term, doc FROM {vocab} WHERE term IN ({marks})", terms))
     raw = dict(db.execute(f"SELECT term, doc FROM fts_v WHERE term IN ({marks})", terms))
-    total = db.execute("SELECT count(*) FROM atoms").fetchone()[0] or 1
     units = int((db.execute("SELECT v FROM meta WHERE k='units'").fetchone() or [0])[0] or 0) or 1
+    total = (db.execute("SELECT count(*) FROM atoms").fetchone()[0] if vocab == "atoms_v" else units) or 1
     cap = max(2, HINT_COMMON * total)
     rare = {s: df[s] for s in stems if df.get(s) and df[s] <= cap}
     rare_ids = {i: df[i] for i in ids if df.get(i) and df[i] <= cap and "https" not in i}
@@ -1859,7 +1862,7 @@ def hint(db, text, names=(), sessions=(), before=None, limit=HINT_LIMIT, now=Non
     need = HINT_MIN_MATCH if recall else max(HINT_MIN_MATCH, min(HINT_MAX_NEED, math.ceil(HINT_SHARE * weight)))
     need_specific = 1 if recall else HINT_SPECIFIC
     if weight < need or not specific:
-        return []
+        return recall_raw(db, text, need, session_docs(db, sessions), before) if recall else []
     parts = []
     if rare:
         parts.append("stem : (" + " OR ".join(fts_quote(s) for s in rare) + ")")
@@ -1871,9 +1874,9 @@ def hint(db, text, names=(), sessions=(), before=None, limit=HINT_LIMIT, now=Non
         sql += " AND rowid < ?"
         params.append(rowid_floor(before))
     cands = dict(db.execute(sql + " ORDER BY 2 LIMIT 40", params).fetchall())
-    if not cands:
-        return []
     skip = session_docs(db, sessions)
+    if not cands:
+        return recall_raw(db, text, need, skip, before) if recall else []
     ref = before if before is not None else (now or time.time())
     scored = []
     for aid, kind, claim, quote, ents, ts, conf, sup, canon, proj, title, qs in db.execute(
@@ -1907,6 +1910,47 @@ def hint(db, text, names=(), sessions=(), before=None, limit=HINT_LIMIT, now=Non
         docs.add(h["doc"])
         out.append(h)
         if len(out) >= limit:
+            break
+    if recall and not out:
+        out = recall_raw(db, text, need, skip, before)
+    return out
+
+
+HINT_RAW = 2            # places in raw chats, Slack, tasks, MRs shown when a recalling message found no atom
+HINT_RAW_TEXT = 600      # chars of the message the raw lookup searches by (p95 ~270 ms in-process; 1200 → ~500)
+HINT_RAW_POOL = 80      # candidates the raw lookup ranks (tens of ms instead of ~500 for a full search)
+
+
+def recall_raw(db, text, need, skip, before):
+    """For a message that recalls the past and found no atom: where the raw index has it, under the same rule —
+    the place's own message shares `need` words with it that are rare in the raw chats, one of them specific, or
+    an id with a digit."""
+    rare, ids, specific, strong = hint_terms(db, text[:HINT_TEXT], vocab="fts_v")
+    if len(rare) + 2 * len(ids) < need or not specific:
+        return []
+    out = []
+    # Why: the whole message ranks the places best (its rarest words alone found more noise, judged 38% vs 61%);
+    # a small pool and no atoms keep it fast.
+    for h in search(db, text[:HINT_RAW_TEXT], before=before, limit=6, exclude=skip, pool=HINT_RAW_POOL, atoms=False):
+        if not h["unit"]:
+            continue
+        body = unit_text(db, h["unit"])
+        role = db.execute("SELECT role FROM units WHERE id=?", (h["unit"],)).fetchone()[0]
+        if role in ("user", "relay") and "?" in body:
+            continue                  # the same question asked before is not its answer
+        have = set(stem_text(body).split())
+        matched = [s for s in rare if s in have]
+        id_hit = [i for i in ids if i in set(extract_ids(body))]
+        if len(matched) + 2 * len(id_hit) < need:
+            continue
+        if not strong.intersection(id_hit) and not specific.intersection(matched + id_hit):
+            continue
+        canon = db.execute("SELECT COALESCE(canon, id) FROM docs WHERE key=?", (h["key"],)).fetchone()[0]
+        out.append({"id": None, "kind": "said", "date": (h["ts"] or "")[8:10] + "." + (h["ts"] or "")[5:7],
+                    "ts": h["ts"], "claim": around(body, [m for m in matched] or [text[:20]], 200), "chat": h["title"],
+                    "project": h["project"], "doc": canon, "key": h["key"], "source": h["source"],
+                    "matched": matched + id_hit, "score": h["score"]})
+        if len(out) >= HINT_RAW:
             break
     return out
 
@@ -1965,7 +2009,7 @@ def cmd_hint(args):
         try:
             os.makedirs(os.path.dirname(os.path.abspath(args.once)), exist_ok=True)
             with open(args.once, "a", encoding="utf-8") as f:
-                f.write("".join(f"{h['id']}\n" for h in hits))
+                f.write("".join(f"{h['id']}\n" for h in hits if h["id"] is not None))
         except OSError:
             pass
     ms = round((time.perf_counter() - t) * 1000, 1)
@@ -1985,7 +2029,10 @@ def cmd_hint(args):
               "if it matters, check it before relying on it:")
         for h in hits:
             where = f", {h['project']}" if h["project"] and h["project"] not in names else ""
-            print(f"- {h['date']}{where} · {h['kind']}: {h['claim']}")
+            if h["id"] is None:       # a raw place, not an atom: say where, the agent opens it to read
+                print(f"- {h['date']}{where} · said in «{(h['chat'] or '')[:70]}» ({h['source']}, {h['key']}): {h['claim']}")
+            else:
+                print(f"- {h['date']}{where} · {h['kind']}: {h['claim']}")
         print(f"Source chat: `python3 {os.path.join(args.hq, 'scripts', 'hq_brain.py')} search \"<words of the claim>\"`.")
     return 0
 
@@ -2047,6 +2094,120 @@ def persona(db, cap=PERSONA_CAP):
                 break
         sections.append({"kind": kind, "heading": heading, "lines": lines})
     return sections
+
+
+TIMELINE_LIMIT = 80
+
+
+def around(text, needles, width=240):
+    """The text around the first needle found (case-insensitive), else its start."""
+    low = text.lower()
+    pos = min((p for p in (low.find(n.lower()) for n in needles if n) if p >= 0), default=0)
+    a = max(0, pos - 80)
+    out = re.sub(r"\s+", " ", text[a:a + width]).strip()
+    return ("…" if a else "") + out + ("…" if a + width < len(text) else "")
+
+
+def timeline(hq, db, entity, limit=TIMELINE_LIMIT, since=None):
+    """Every place an entity is mentioned, newest first, one row per document and day: a task or MR id (DEV-123,
+    !19, repo!19), a registry project, or words (a person's name — all of them must be there). Atoms win over raw
+    text in their group. Returns (how it matched, rows)."""
+    ids = [i for i in extract_ids(entity) if not DATE_ID_RE.match(i)]
+    names = project_names(hq, entity) if re.fullmatch(r"[\w.-]+", entity) and not ids else set()
+    known = names and db.execute(f"SELECT 1 FROM docs WHERE project IN ({','.join('?' * len(names))}) LIMIT 1",
+                                 sorted(names)).fetchone()
+    rows = []                                    # (ts, canon, unit id or -atom id)
+    if ids:
+        match, how = "ids : (" + " OR ".join(fts_quote(i) for i in ids) + ")", "id"
+    elif known:
+        match, how = None, "project"
+    else:
+        stems = [stem(t) for t in words(entity) if t not in STOP]
+        if not stems:
+            return "nothing", []
+        match, how = " AND ".join(f"stem : {fts_quote(s)}" for s in stems), "words"
+    if match:
+        uids = [r[0] for r in db.execute("SELECT rowid FROM fts WHERE fts MATCH ?", (match,))]
+        for i in range(0, len(uids), 900):
+            chunk = uids[i:i + 900]
+            rows += db.execute("SELECT u.ts, COALESCE(d.canon, d.id), u.id FROM units u JOIN docs d ON d.id = u.doc "
+                               f"WHERE u.id IN ({','.join('?' * len(chunk))})", chunk).fetchall()
+        if has_atoms(db):
+            aids = [r[0] for r in db.execute("SELECT rowid FROM atoms_fts WHERE atoms_fts MATCH ?", (match,))]
+            if aids:
+                rows += db.execute("SELECT a.ts, COALESCE(d.canon, d.id), -a.id FROM atoms a JOIN docs d ON d.id = a.doc "
+                                   f"WHERE a.superseded_by IS NULL AND a.id IN ({','.join('?' * len(aids))})", aids).fetchall()
+    else:
+        marks = ",".join("?" * len(names))
+        rows = db.execute("SELECT u.ts, COALESCE(d.canon, d.id), u.id FROM units u JOIN docs d ON d.id = u.doc "
+                          f"WHERE d.project IN ({marks}) OR d.canon IN (SELECT id FROM docs WHERE project IN ({marks}))",
+                          sorted(names) * 2).fetchall()
+    skip = [m.lower() for m in as_list(read_yaml_subset(os.path.join(hq, "hq.yaml")).get("brain_atoms_skip"))]
+    keep = {}
+
+    def kept(canon):
+        """Not an automation's run (`brain_atoms_skip:` in its title, or weighed down as one) and not a program's
+        run (no message anyone typed: every user-role message relayed)."""
+        if canon not in keep:
+            title, weight = db.execute("SELECT title, weight FROM docs WHERE id=?", (canon,)).fetchone()
+            members = [canon] + [r[0] for r in db.execute("SELECT id FROM docs WHERE canon=?", (canon,))]
+            marks = ",".join("?" * len(members))
+            # Why: EXISTS on the units_doc index stops at the first hit; counting a long chat's roles does not.
+            relay = db.execute(f"SELECT 1 FROM units WHERE doc IN ({marks}) AND role='relay' LIMIT 1", members).fetchone()
+            owner = db.execute(f"SELECT 1 FROM units WHERE doc IN ({marks}) AND role='user' LIMIT 1", members).fetchone()
+            keep[canon] = (weight or 1.0) >= 1.0 and not any(m in (title or "").lower() for m in skip) \
+                and not (relay and not owner)
+        return keep[canon]
+
+    groups = {}
+    for ts, canon, ref in rows:
+        if ts is None or (since is not None and ts < since) or not kept(canon):
+            continue
+        day = dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        g = groups.setdefault((canon, day), {"ts": ts, "refs": []})
+        g["ts"] = max(g["ts"], ts)
+        g["refs"].append((ref < 0, ts, ref))
+    ranked = sorted(groups.items(), key=lambda kv: -kv[1]["ts"])[:limit]
+    docs = {}
+    out = []
+    needles = [entity] + [i.replace("_", "-") for i in ids]
+    for (canon, day), g in ranked:
+        if canon not in docs:
+            docs[canon] = db.execute("SELECT key, source, project, title, link FROM docs WHERE id=?", (canon,)).fetchone()
+        key, source, proj, title, link = docs[canon]
+        is_atom, ts, ref = max(g["refs"])          # an atom if there is one, else the latest message
+        atom = None
+        if is_atom:
+            kind, claim = db.execute("SELECT kind, claim FROM atoms WHERE id=?", (-ref,)).fetchone()
+            atom, text = kind, claim
+        else:
+            text = around(unit_text(db, ref), needles)
+        out.append({"ts": iso(ts), "day": day, "key": key, "source": source, "project": proj, "title": title,
+                    "link": link, "atom": atom, "mentions": len(g["refs"]), "text": text})
+    return how, out
+
+
+def cmd_timeline(args):
+    _, path = load_config(args.hq)
+    try:
+        db = connect(path)
+    except FileNotFoundError:
+        return 3
+    t = time.perf_counter()
+    how, rows = timeline(args.hq, db, args.entity, args.limit, parse_ts(args.since) if args.since else None)
+    ms = round((time.perf_counter() - t) * 1000, 1)
+    if args.json:
+        print(json.dumps({"entity": args.entity, "matched_by": how, "ms": ms, "rows": rows}, ensure_ascii=False, indent=1))
+        return 0
+    day = None
+    for r in rows:
+        if r["day"] != day:
+            day = r["day"]
+            print(day)
+        print(f"  {r['ts'][11:16]} [{r['source']}] {r['project'] or '-'} — {(r['title'] or '')[:70]}")
+        print(f"     {('[' + r['atom'] + '] ') if r['atom'] else ''}{r['text'][:200]}")
+    print(f"({len(rows)} rows, matched by {how}, {ms:.0f} ms)")
+    return 0
 
 
 def cmd_repeats(args):
@@ -2288,18 +2449,23 @@ def main(argv=None):
     p.add_argument("--until", help="ISO time (default: now)")
     p.add_argument("--log", help="the hint hook's log, to tell which of them got a hint")
     p.add_argument("--json", action="store_true")
+    p = sub.add_parser("timeline", help="every place a task, MR, person or project is mentioned, by day")
+    p.add_argument("entity", help="DEV-123, !19, repo!19, a registry slug, or words (a person's name)")
+    p.add_argument("--limit", type=int, default=TIMELINE_LIMIT, help="rows (one per document and day)")
+    p.add_argument("--since", help="ISO time")
+    p.add_argument("--json", action="store_true")
     p = sub.add_parser("persona", help="the owner's portrait from atoms: preferences, corrections, people")
     p.add_argument("--out", help="write markdown here")
     p.add_argument("--limit", type=int, default=PERSONA_CAP, help="lines per section")
     p.add_argument("--json", action="store_true")
-    for name in ("index", "search", "atoms", "questions", "eval", "stats", "brief", "hint", "repeats", "persona"):
+    for name in ("index", "search", "atoms", "questions", "eval", "stats", "brief", "hint", "repeats", "persona", "timeline"):
         sub.choices[name].add_argument("--hq", default=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     args.hq = os.path.abspath(os.path.expanduser(args.hq))
     try:
         return {"index": cmd_index, "search": cmd_search, "atoms": cmd_atoms, "questions": cmd_questions, "eval": cmd_eval,
                 "stats": cmd_stats, "brief": cmd_brief, "hint": cmd_hint, "repeats": cmd_repeats,
-                "persona": cmd_persona}[args.cmd](args)
+                "persona": cmd_persona, "timeline": cmd_timeline}[args.cmd](args)
     except ValueError as exc:
         print(f"hq.yaml: {exc}", file=sys.stderr)
         return 3

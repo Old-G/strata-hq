@@ -2,6 +2,17 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer.
 
+## [0.9.0] — 2026-11-05
+
+### Added
+- `hq_brain.py timeline "<DEV-123 | !19 | slug | name>"` — every place an entity is mentioned, one row per document
+  and day, atoms first in their group; automation and program runs left out. For an entity screen.
+- `hint`: a message that recalls the past and finds no atom gets up to 2 places from the raw index (chats, threads,
+  tasks, MRs) where the same thing was said, under the same rare-and-specific word rule counted on the raw
+  vocabulary; the owner's own earlier question is skipped. On 120 real recalling messages: a hint on 75, a useful
+  place in 36 (second-model judge), none misleading; p95 ~270 ms in-process.
+- Index `docs_canon`.
+
 ## [0.8.2] — 2026-11-05
 
 ### Fixed

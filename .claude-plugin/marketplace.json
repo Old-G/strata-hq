@@ -9,7 +9,7 @@
       "name": "strata-hq",
       "source": "./",
       "description": "One place above all your projects: registry from a declared source, a page per project and per group, refreshed from git.",
-      "version": "0.9.0",
+      "version": "0.9.1",
       "license": "MIT",
       "category": "workflow",
       "keywords": ["wiki", "knowledge-base", "multi-repo", "portfolio"]

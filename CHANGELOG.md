@@ -2,6 +2,12 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer.
 
+## [0.9.1] — 2026-11-05
+
+### Security
+- `hint`: a raw place's fragment (text others wrote) is printed as one quoted line, without the chat title, under a
+  header that marks it as data, never instructions.
+
 ## [0.9.0] — 2026-11-05
 
 ### Added

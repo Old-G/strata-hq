@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "strata-hq",
   "displayName": "Strata HQ",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "One place above all your projects: a meta-wiki (HQ) that lists your projects where they already live, keeps a page per project and per group, and refreshes them from git without rewriting what did not change. Companion to Strata; works without it.",
   "author": {
     "name": "Old-G"

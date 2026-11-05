@@ -360,6 +360,18 @@ brain index >/dev/null 2>&1
 ukeys() { brain search "$@" --json | python3 -c 'import json,sys;print(" ".join(h["key"] for h in json.load(sys.stdin)["hits"]))'; }
 check "a print-mode run's prompt (entrypoint sdk-cli) is not the owner's words" "$(ukeys "классифицируй" --role user)" ""
 check "…but stays searchable" "$(ukeys "классифицируй" --limit 1)" "$S7"
+check "an SDK run (sdk-ts, sdk-py) is a program's prompt too" "$(cd "$HQ" && python3 -c 'import sys; sys.path.insert(0, "scripts"); import hq_brain as b; print(sorted(b.PROGRAM_ENTRYPOINTS))')" "['sdk-cli', 'sdk-py', 'sdk-ts']"
+check "the same message from two sources: the copy that says the owner typed it wins" "$(cd "$HQ" && python3 - "$WORK/dedupe.sqlite" <<'PY'
+import sys, zlib; sys.path.insert(0, "scripts"); import hq_brain as b
+db = b.connect(sys.argv[1], write=True)
+db.execute("INSERT INTO docs(id, key, source) VALUES (1, 'chat', 'app'), (2, 'copy', 'claude')")
+db.execute("UPDATE docs SET canon=1 WHERE id=2")
+for uid, doc, role, text in ((10, 2, "relay", "Сделай отчёт по складу"), (11, 1, "user", "Сделай отчёт по складу"),
+                             (12, 1, "assistant", "Готово")):
+    db.execute("INSERT INTO units(id, doc, ts, role, text) VALUES (?,?,?,?,?)", (uid, doc, 100 + uid % 10, role, zlib.compress(text.encode())))
+print(" ".join(m["role"] for m in b.chat_dialogue(db, 1)))
+PY
+)" "user assistant"
 check "search --role user --since: the owner's own messages after a time" "$(ukeys "храним четырнадцать" --role user --since 2026-01-16)" "$S8"
 check "search --json: spread over chats, days, projects" "$(brain search "храним четырнадцать" --role user --json | python3 -c 'import json,sys;print(json.load(sys.stdin)["spread"])')" "{'chats': 2, 'days': 2, 'projects': 1}"
 out="$(brain repeats --since 2026-01-18 --until 2026-01-19 --json)"

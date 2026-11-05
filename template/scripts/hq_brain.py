@@ -104,7 +104,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hq_registry import read_yaml_subset  # noqa: E402  (same folder)
 from hq_stem import stem, stem_en, translit, words  # noqa: E402
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 SCHEMA = 2
 CHUNK = 2500            # chars per unit; longer messages and sections are split at paragraphs
 MIN_PARA = 60           # a paragraph shorter than this (normalised) is never a "repeat"
@@ -622,6 +622,11 @@ def first_ts(path, scan=40):
     return None
 
 
+# `claude -p` and the SDKs: the prompt is a program's. An app's chat window on the TS SDK is sdk-ts too — its own
+# source (a command row with role user/relay) says who typed, and chat_dialogue prefers that copy.
+PROGRAM_ENTRYPOINTS = ("sdk-cli", "sdk-py", "sdk-ts")
+
+
 def read_claude(ix, src, path, session, fid):
     msgs, title, first_user, cwd = [], None, None, None
     try:
@@ -644,8 +649,8 @@ def read_claude(ix, src, path, session, fid):
                     or d.get("isCompactSummary") or d.get("toolUseResult"):
                 continue
             cwd = cwd or d.get("cwd")
-            if kind == "user" and d.get("entrypoint") == "sdk-cli":
-                kind = "relay"                   # a print-mode run: the prompt is a program's, not the owner's
+            if kind == "user" and d.get("entrypoint") in PROGRAM_ENTRYPOINTS:
+                kind = "relay"                   # a print-mode or SDK run: the prompt is a program's, not the owner's
             content = (d.get("message") or {}).get("content")
             if isinstance(content, str):
                 text = content
@@ -1266,19 +1271,23 @@ def chat_dialogue(db, cid, budget=ATOM_BUDGET):
     rows = db.execute("SELECT u.id, u.ts, u.role, u.text FROM units u JOIN docs d ON d.id = u.doc "
                       "WHERE COALESCE(d.canon, d.id)=? AND u.dup IS NULL AND u.role IN ('user','assistant','relay') "
                       "ORDER BY u.ts, u.id", (cid,)).fetchall()
-    msgs, seen = [], set()
+    msgs = []
     for uid, ts, role, blob in rows:
         text = zlib.decompress(blob).decode("utf-8", "replace")
         if msgs and msgs[-1]["role"] == role and msgs[-1]["ts"] == ts:      # chunks of one message
             msgs[-1]["text"] += "\n\n" + text
             continue
         msgs.append({"role": role, "ts": ts, "unit": uid, "text": text})
-    out = []
+    out, seen = [], {}
     for m in msgs:
         key = " ".join(words(m["text"]))[:400]
-        if not key or key in seen:                                        # same message via two sources
+        if not key:
             continue
-        seen.add(key)
+        if key in seen:                                                   # same message via two sources:
+            if m["role"] == "user" and seen[key]["role"] == "relay":      # the one that knows the owner typed it wins
+                seen[key]["role"] = "user"
+            continue
+        seen[key] = m
         m["text"] = mask(m["text"].strip())
         out.append(m)
     for m in out:

@@ -2,6 +2,13 @@
 
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer.
 
+## [0.8.1] — 2026-11-05
+
+### Fixed
+- The owner's own words: Claude runs from the SDKs (`sdk-py`, `sdk-ts`) count as a program's prompt (`relay`) like
+  `sdk-cli`; an app chat on the TS SDK keeps the owner's turns through its own source — when one message comes
+  from two sources, the copy marked `user` wins. On one real index the owner-typed messages went 66.8k → 4.4k.
+
 ## [0.8.0] — 2026-11-05
 
 ### Added
